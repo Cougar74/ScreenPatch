@@ -1,5 +1,5 @@
 use std::num::NonZeroU32;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use global_hotkey::{
     hotkey::{Code, HotKey, Modifiers},
@@ -290,16 +290,18 @@ impl App {
                 item.display.scale,
             )
             .ok_or_else(|| format!("масштаб монитора {} некорректен", item.display.id))?;
-            let attributes = WindowAttributes::default()
-                .with_title(format!("ScreenPatch {}", item.display.id))
-                .with_decorations(false)
-                .with_resizable(false)
-                .with_window_level(WindowLevel::AlwaysOnTop)
-                .with_inner_size(LogicalSize::new(logical_w as f64, logical_h as f64))
-                .with_position(PhysicalPosition::new(
-                    item.display.origin_x,
-                    item.display.origin_y,
-                ));
+            let attributes = apply_window_icon(
+                WindowAttributes::default()
+                    .with_title(format!("ScreenPatch {}", item.display.id))
+                    .with_decorations(false)
+                    .with_resizable(false)
+                    .with_window_level(WindowLevel::AlwaysOnTop)
+                    .with_inner_size(LogicalSize::new(logical_w as f64, logical_h as f64))
+                    .with_position(PhysicalPosition::new(
+                        item.display.origin_x,
+                        item.display.origin_y,
+                    )),
+            );
             let window = Arc::new(event_loop.create_window(attributes).map_err(|err| {
                 format!("не удалось создать слой монитора {}: {err}", item.display.id)
             })?);
@@ -505,14 +507,16 @@ impl App {
         let position_y = display.origin_y
             + logical_to_physical_px(local_y, display.scale)
                 .ok_or_else(|| format!("не удалось перевести положение окна монитора {}", display.id))?;
-        let attributes = WindowAttributes::default()
-            .with_title("ScreenPatch")
-            .with_decorations(false)
-            .with_resizable(false)
-            .with_window_level(WindowLevel::AlwaysOnTop)
-            .with_min_inner_size(LogicalSize::new(120.0, 80.0))
-            .with_inner_size(LogicalSize::new(logical_w as f64, logical_h as f64))
-            .with_position(PhysicalPosition::new(position_x, position_y));
+        let attributes = apply_window_icon(
+            WindowAttributes::default()
+                .with_title("ScreenPatch")
+                .with_decorations(false)
+                .with_resizable(false)
+                .with_window_level(WindowLevel::AlwaysOnTop)
+                .with_min_inner_size(LogicalSize::new(120.0, 80.0))
+                .with_inner_size(LogicalSize::new(logical_w as f64, logical_h as f64))
+                .with_position(PhysicalPosition::new(position_x, position_y)),
+        );
         let window = Arc::new(
             event_loop
                 .create_window(attributes)
@@ -903,7 +907,8 @@ impl App {
             items.iter().map(|item| item as _).collect();
         menu.append_items(&refs)
             .map_err(|err| format!("не удалось собрать меню значка: {err}"))?;
-        let icon = Icon::from_rgba(vec![0x3a, 0x7c, 0xff, 0xff].repeat(32 * 32), 32, 32)
+        let source = app_icon()?;
+        let icon = Icon::from_rgba(source.pixels.clone(), source.width, source.height)
             .map_err(|err| format!("не удалось создать значок: {err}"))?;
         let tray = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
@@ -1021,6 +1026,46 @@ impl App {
             image::ExtendedColorType::Rgba8,
         ) {
             eprintln!("не удалось сохранить снимок {number}: {err}");
+        }
+    }
+}
+
+struct AppIcon {
+    pixels: Vec<u8>,
+    width: u32,
+    height: u32,
+}
+
+fn app_icon() -> Result<&'static AppIcon, String> {
+    static ICON: OnceLock<Result<AppIcon, String>> = OnceLock::new();
+    ICON.get_or_init(|| {
+        let image = image::load_from_memory(include_bytes!("icon.png"))
+            .map_err(|err| format!("не удалось прочитать значок: {err}"))?;
+        let rgba = image.to_rgba8();
+        let (width, height) = rgba.dimensions();
+        Ok(AppIcon {
+            pixels: rgba.into_raw(),
+            width,
+            height,
+        })
+    })
+    .as_ref()
+    .map_err(Clone::clone)
+}
+
+fn apply_window_icon(attributes: WindowAttributes) -> WindowAttributes {
+    let source = match app_icon() {
+        Ok(source) => source,
+        Err(err) => {
+            eprintln!("{err}");
+            return attributes;
+        }
+    };
+    match winit::window::Icon::from_rgba(source.pixels.clone(), source.width, source.height) {
+        Ok(icon) => attributes.with_window_icon(Some(icon)),
+        Err(err) => {
+            eprintln!("не удалось поставить значок окна: {err}");
+            attributes
         }
     }
 }
