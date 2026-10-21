@@ -1,6 +1,47 @@
 use crate::core::geometry::CaptureRect;
 use crate::core::refresh::{image_frame, ImageFrame};
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct MonitorReadiness {
+    pub id: String,
+    pub scale: f64,
+    pub physical_width: u32,
+    pub physical_height: u32,
+    pub frame_ready: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SelectionAbort {
+    NoMonitors,
+    BadScale { id: String },
+    EmptySize { id: String },
+    CaptureFailed { id: String },
+}
+
+pub fn selection_ready(monitors: &[MonitorReadiness]) -> Result<(), SelectionAbort> {
+    if monitors.is_empty() {
+        return Err(SelectionAbort::NoMonitors);
+    }
+    for monitor in monitors {
+        if !monitor.scale.is_finite() || monitor.scale <= 0.0 {
+            return Err(SelectionAbort::BadScale {
+                id: monitor.id.clone(),
+            });
+        }
+        if monitor.physical_width == 0 || monitor.physical_height == 0 {
+            return Err(SelectionAbort::EmptySize {
+                id: monitor.id.clone(),
+            });
+        }
+        if !monitor.frame_ready {
+            return Err(SelectionAbort::CaptureFailed {
+                id: monitor.id.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
 const GLYPH_SCALE: i32 = 2;
 const GLYPH_GAP: i32 = 2;
 const LABEL_PAD: i32 = 2;

@@ -73,3 +73,17 @@ fn with_visibility_restore<T>(
     let _guard = Restore(Some(restore_visibility));
     body()
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RefreshBlock {
+    MonitorMissing,
+    GeometryChanged,
+}
+
+pub fn refresh_gate(saved: &Fingerprint, monitors: &[Fingerprint]) -> Result<(), RefreshBlock> {
+    match monitors.iter().find(|monitor| monitor.id == saved.id) {
+        None => Err(RefreshBlock::MonitorMissing),
+        Some(monitor) if fingerprints_match(saved, monitor) => Ok(()),
+        Some(_) => Err(RefreshBlock::GeometryChanged),
+    }
+}

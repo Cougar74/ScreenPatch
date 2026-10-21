@@ -24,9 +24,10 @@ use screenpatch::core::geometry::{
 use screenpatch::core::patches::{
     layout_client, letterbox, AddPatchError, CommitRefreshError, PatchManager,
 };
-use screenpatch::core::refresh::{fingerprints_match, refresh_current, ImageFrame};
+use screenpatch::core::refresh::{refresh_current, refresh_gate, ImageFrame, RefreshBlock};
 use screenpatch::core::selection::{
     compose_overlay, crop_frame, normalize_drag, physical_cursor_point, selection_accepted,
+    selection_ready, MonitorReadiness, SelectionAbort,
 };
 use screenpatch::platform::{
     acquire_single_instance, capture_monitor_region, choose_png_path, confirm_close_all,
@@ -140,32 +141,53 @@ fn enable_per_monitor_dpi() {
 }
 
 fn prepare_overlays(displays: &[DisplayInfo]) -> Result<Vec<PreparedOverlay>, String> {
-    if displays.is_empty() {
-        return Err("мониторы не найдены".to_string());
-    }
+    let mut readiness = Vec::new();
     let mut prepared = Vec::new();
+    let mut capture_error = None;
     for display in displays {
-        if !display.scale.is_finite() || display.scale <= 0.0 {
-            return Err(format!("масштаб монитора {} некорректен", display.id));
+        let scale_ok = display.scale.is_finite() && display.scale > 0.0;
+        let size_ok = display.physical_width > 0 && display.physical_height > 0;
+        let mut frame_ready = false;
+        if scale_ok && size_ok {
+            let region = CaptureRect {
+                x: 0,
+                y: 0,
+                width: display.physical_width,
+                height: display.physical_height,
+            };
+            match capture_monitor_region(&display.id, region) {
+                Ok(frame) => {
+                    frame_ready = true;
+                    prepared.push(PreparedOverlay {
+                        display: display.clone(),
+                        frame,
+                    });
+                }
+                Err(err) => {
+                    if capture_error.is_none() {
+                        capture_error = Some(err.message);
+                    }
+                }
+            }
         }
-        if display.physical_width == 0 || display.physical_height == 0 {
-            return Err(format!("размер монитора {} некорректен", display.id));
-        }
-        let region = CaptureRect {
-            x: 0,
-            y: 0,
-            width: display.physical_width,
-            height: display.physical_height,
-        };
-        let frame = capture_monitor_region(&display.id, region).map_err(|err| {
-            format!("захват монитора {} не удался: {}", display.id, err.message)
-        })?;
-        prepared.push(PreparedOverlay {
-            display: display.clone(),
-            frame,
+        readiness.push(MonitorReadiness {
+            id: display.id.clone(),
+            scale: display.scale,
+            physical_width: display.physical_width,
+            physical_height: display.physical_height,
+            frame_ready,
         });
     }
-    Ok(prepared)
+    match selection_ready(&readiness) {
+        Ok(()) => Ok(prepared),
+        Err(SelectionAbort::NoMonitors) => Err("мониторы не найдены".to_string()),
+        Err(SelectionAbort::BadScale { id }) => Err(format!("масштаб монитора {id} некорректен")),
+        Err(SelectionAbort::EmptySize { id }) => Err(format!("размер монитора {id} некорректен")),
+        Err(SelectionAbort::CaptureFailed { id }) => Err(format!(
+            "не удалось снять монитор {id}: {}",
+            capture_error.unwrap_or_default()
+        )),
+    }
 }
 
 impl ApplicationHandler for App {
@@ -240,6 +262,9 @@ impl ApplicationHandler for App {
                 ..
             } => self.end_corner_resize(index),
             WindowEvent::Resized(_) => self.windows[index].window.request_redraw(),
+            WindowEvent::ScaleFactorChanged { .. } => {
+                self.windows[index].window.request_redraw();
+            }
             WindowEvent::RedrawRequested => self.paint_patch(index),
             _ => {}
         }
@@ -569,13 +594,20 @@ impl App {
                 return;
             }
         };
-        let Some(display) = displays.iter().find(|display| display.id == monitor_id) else {
-            log_refresh_cancel(&monitor_id, region, "монитор больше не подключён");
-            return;
-        };
-        if !fingerprints_match(&saved, &display.fingerprint()) {
-            log_refresh_cancel(&monitor_id, region, "геометрия монитора изменилась");
-            return;
+        let monitors: Vec<screenpatch::core::refresh::Fingerprint> = displays
+            .iter()
+            .map(|display| display.fingerprint())
+            .collect();
+        match refresh_gate(&saved, &monitors) {
+            Ok(()) => {}
+            Err(RefreshBlock::MonitorMissing) => {
+                log_refresh_cancel(&monitor_id, region, "монитор больше не подключён");
+                return;
+            }
+            Err(RefreshBlock::GeometryChanged) => {
+                log_refresh_cancel(&monitor_id, region, "геометрия монитора изменилась");
+                return;
+            }
         }
 
         let hide = !self.windows[index].affinity;
@@ -708,14 +740,37 @@ impl App {
             eprintln!("лимит окон достигнут: уже открыто 10 снимков");
             return;
         }
+        let remembered: Vec<(Arc<Window>, bool)> = self
+            .windows
+            .iter()
+            .map(|patch| {
+                (
+                    Arc::clone(&patch.window),
+                    patch.window.is_visible().unwrap_or(true),
+                )
+            })
+            .collect();
         match self.capture_prepared() {
             Ok(prepared) => {
                 self.prepared = Some(prepared);
                 if let Err(err) = self.open_overlays(event_loop) {
                     eprintln!("не удалось открыть слои выделения: {err}");
+                    self.abort_selection(&remembered);
                 }
             }
-            Err(err) => eprintln!("не удалось начать новое выделение: {err}"),
+            Err(err) => {
+                eprintln!("не удалось начать новое выделение: {err}");
+                self.abort_selection(&remembered);
+            }
+        }
+    }
+
+    fn abort_selection(&mut self, remembered: &[(Arc<Window>, bool)]) {
+        self.drag = None;
+        self.prepared = None;
+        self.overlays.clear();
+        for (window, visible) in remembered {
+            window.set_visible(*visible);
         }
     }
 
@@ -742,7 +797,7 @@ impl App {
             if !hidden.is_empty() && wait_until_hidden(&hwnds).is_err() {
                 return Err("не удалось подтвердить скрытие окон".to_string());
             }
-            let displays = list_displays().map_err(|err| err.message)?;
+            let displays = list_displays().map_err(|err| format!("мониторы не найдены: {}", err.message))?;
             prepare_overlays(&displays)
         })();
         for (window, visible) in &hidden {
