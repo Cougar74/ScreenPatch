@@ -14,6 +14,7 @@ use windows::Win32::UI::HiDpi::{
 use screenpatch::core::geometry::{
     logical_to_physical_px, logical_window_size, place_window, CaptureRect, LogicalRect,
 };
+use screenpatch::core::patches::{pointer_hit, render_patch, AddPatchError, PatchManager, PointerHit};
 use screenpatch::core::refresh::{fingerprints_match, refresh_current, ImageFrame};
 use screenpatch::core::selection::{compose_overlay, crop_frame, normalize_drag, physical_cursor_point, selection_accepted};
 use screenpatch::platform::{
@@ -42,13 +43,22 @@ struct Drag {
     current: (i32, i32),
 }
 
+struct CornerResize {
+    window_id: WindowId,
+    anchor: (i32, i32),
+    width: u32,
+    height: u32,
+}
+
 struct PatchWindow {
+    number: u64,
     window: Arc<Window>,
     surface: softbuffer::Surface<Arc<Window>, Arc<Window>>,
     #[allow(dead_code)]
     context: softbuffer::Context<Arc<Window>>,
     region: CaptureRect,
     frame: ImageFrame,
+    cursor: Option<(i32, i32)>,
     fingerprint_id: String,
     origin_x: i32,
     origin_y: i32,
@@ -63,7 +73,9 @@ struct App {
     prepared: Option<Vec<PreparedOverlay>>,
     overlays: Vec<OverlayWindow>,
     windows: Vec<PatchWindow>,
+    patches: PatchManager,
     drag: Option<Drag>,
+    corner: Option<CornerResize>,
     started: bool,
     startup_error: Option<String>,
 }
@@ -84,7 +96,9 @@ fn run() -> Result<(), String> {
         prepared: Some(prepared),
         overlays: Vec::new(),
         windows: Vec::new(),
+        patches: PatchManager::new(),
         drag: None,
+        corner: None,
         started: false,
         startup_error: None,
     };
@@ -162,30 +176,43 @@ impl ApplicationHandler for App {
             return;
         };
         match event {
-            WindowEvent::CloseRequested => {
-                self.windows.retain(|patch| patch.window.id() != window_id);
-                if self.windows.is_empty() {
-                    event_loop.exit();
-                }
-            }
-            WindowEvent::KeyboardInput { event, .. } => {
-                if event.state != ElementState::Pressed || event.repeat {
+            WindowEvent::CloseRequested => self.close_patch(index, event_loop),
+            WindowEvent::KeyboardInput {
+                event,
+                is_synthetic,
+                ..
+            } => {
+                // При закрытии окна фокус уходит на следующее, и winit заново
+                // сообщает уже зажатые клавиши. Такое сообщение не новое нажатие.
+                if event.state != ElementState::Pressed || event.repeat || is_synthetic {
                     return;
                 }
                 match event.logical_key {
-                    Key::Named(NamedKey::Escape) => event_loop.exit(),
+                    Key::Named(NamedKey::Escape) => self.close_patch(index, event_loop),
                     Key::Character(text) if text.eq_ignore_ascii_case("r") => self.refresh(index),
+                    Key::Character(text) if text.eq_ignore_ascii_case("s") => {
+                        self.begin_selection(event_loop)
+                    }
                     _ => {}
                 }
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                let scale = self.windows[index].window.scale_factor();
+                self.windows[index].cursor = logical_client_point(position.x, position.y, scale);
+                self.update_patch_cursor(index);
+                self.apply_corner_resize(index);
             }
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
                 button: MouseButton::Left,
                 ..
-            } => {
-                let window = Arc::clone(&self.windows[index].window);
-                let _ = window.drag_window();
-            }
+            } => self.begin_patch_pointer(index),
+            WindowEvent::MouseInput {
+                state: ElementState::Released,
+                button: MouseButton::Left,
+                ..
+            } => self.end_corner_resize(index),
+            WindowEvent::Resized(_) => self.windows[index].window.request_redraw(),
             WindowEvent::RedrawRequested => self.paint_patch(index),
             _ => {}
         }
@@ -265,12 +292,17 @@ impl App {
                     event_loop.exit();
                 }
             }
-            WindowEvent::KeyboardInput { event, .. } => {
+            WindowEvent::KeyboardInput {
+                event,
+                is_synthetic,
+                ..
+            } => {
                 if event.state == ElementState::Pressed
                     && !event.repeat
+                    && !is_synthetic
                     && event.logical_key == Key::Named(NamedKey::Escape)
                 {
-                    event_loop.exit();
+                    self.dismiss_overlays(event_loop);
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
@@ -404,14 +436,18 @@ impl App {
         region: CaptureRect,
         frame: ImageFrame,
     ) -> Result<(), String> {
-        let (logical_w, logical_h) =
+        self.patches
+            .check(&frame)
+            .map_err(|err| patch_add_error(&frame, err))?;
+        let (region_w, region_h) =
             logical_window_size(frame.width, frame.height, display.scale)
                 .ok_or_else(|| format!("масштаб монитора {} некорректен", display.id))?;
+        let (logical_w, logical_h) = (region_w.max(120), region_h.max(80));
         let capture = LogicalRect {
             x: physical_to_logical_i32(region.x, display.scale)?,
             y: physical_to_logical_i32(region.y, display.scale)?,
-            width: logical_w,
-            height: logical_h,
+            width: region_w,
+            height: region_h,
         };
         let (local_x, local_y) = place_window(capture, logical_w, logical_h, display.work);
         let position_x = display.origin_x
@@ -421,10 +457,11 @@ impl App {
             + logical_to_physical_px(local_y, display.scale)
                 .ok_or_else(|| format!("не удалось перевести положение окна монитора {}", display.id))?;
         let attributes = WindowAttributes::default()
-            .with_title(format!("ScreenPatch {}", display.id))
+            .with_title("ScreenPatch")
             .with_decorations(false)
             .with_resizable(false)
             .with_window_level(WindowLevel::AlwaysOnTop)
+            .with_min_inner_size(LogicalSize::new(120.0, 80.0))
             .with_inner_size(LogicalSize::new(logical_w as f64, logical_h as f64))
             .with_position(PhysicalPosition::new(position_x, position_y));
         let window = Arc::new(
@@ -438,14 +475,21 @@ impl App {
             .map_err(|err| format!("не удалось создать поверхность окна: {err}"))?;
         let hwnd = hwnd_from_window(&window).ok_or_else(|| "у окна нет дескриптора Win32".to_string())?;
         let affinity = try_exclude_from_capture(hwnd);
+        let number = match self.patches.add(region, frame.clone()) {
+            Ok(number) => number,
+            Err(err) => return Err(patch_add_error(&frame, err)),
+        };
+        window.set_title(&format!("ScreenPatch {number}"));
         log_monitor(display, region, affinity);
         window.request_redraw();
         self.windows.push(PatchWindow {
+            number,
             window,
             context,
             surface,
             region,
             frame,
+            cursor: None,
             fingerprint_id: display.id.clone(),
             origin_x: display.origin_x,
             origin_y: display.origin_y,
@@ -558,6 +602,8 @@ impl App {
         );
         self.windows[index].refreshing = false;
         if next != current {
+            let number = self.windows[index].number;
+            self.patches.replace_frame(number, next.clone());
             self.windows[index].frame = next;
             self.windows[index].window.request_redraw();
         }
@@ -565,8 +611,152 @@ impl App {
 
     fn paint_patch(&mut self, index: usize) {
         let window = Arc::clone(&self.windows[index].window);
-        let frame = self.windows[index].frame.clone();
+        let size = window.inner_size();
+        let frame = render_patch(&self.windows[index].frame, size.width, size.height);
         present_frame(&window, &mut self.windows[index].surface, &frame);
+    }
+
+    fn dismiss_overlays(&mut self, event_loop: &ActiveEventLoop) {
+        self.drag = None;
+        self.overlays.clear();
+        if self.windows.is_empty() {
+            event_loop.exit();
+        }
+    }
+
+    fn close_patch(&mut self, index: usize, event_loop: &ActiveEventLoop) {
+        let number = self.windows[index].number;
+        let window_id = self.windows[index].window.id();
+        if self
+            .corner
+            .as_ref()
+            .is_some_and(|corner| corner.window_id == window_id)
+        {
+            self.corner = None;
+        }
+        self.patches.close(number);
+        self.windows.remove(index);
+        if self.windows.is_empty() && self.overlays.is_empty() {
+            event_loop.exit();
+        }
+    }
+
+    fn begin_selection(&mut self, event_loop: &ActiveEventLoop) {
+        if !self.overlays.is_empty() {
+            return;
+        }
+        if self.patches.len() >= 10 {
+            eprintln!("лимит окон достигнут: уже открыто 10 снимков");
+            return;
+        }
+        match self.capture_prepared() {
+            Ok(prepared) => {
+                self.prepared = Some(prepared);
+                if let Err(err) = self.open_overlays(event_loop) {
+                    eprintln!("не удалось открыть слои выделения: {err}");
+                }
+            }
+            Err(err) => eprintln!("не удалось начать новое выделение: {err}"),
+        }
+    }
+
+    fn capture_prepared(&mut self) -> Result<Vec<PreparedOverlay>, String> {
+        let hidden: Vec<Arc<Window>> = self
+            .windows
+            .iter()
+            .filter(|patch| !patch.affinity)
+            .map(|patch| Arc::clone(&patch.window))
+            .collect();
+        let hwnds: Vec<Hwnd> = hidden
+            .iter()
+            .filter_map(|window| hwnd_from_window(window))
+            .collect();
+        for window in &hidden {
+            window.set_visible(false);
+        }
+        let result = (|| {
+            if !hidden.is_empty() && wait_until_hidden(&hwnds).is_err() {
+                return Err("не удалось подтвердить скрытие окон".to_string());
+            }
+            let displays = list_displays().map_err(|err| err.message)?;
+            prepare_overlays(&displays)
+        })();
+        for window in &hidden {
+            window.set_visible(true);
+        }
+        result
+    }
+
+    fn begin_patch_pointer(&mut self, index: usize) {
+        let window = Arc::clone(&self.windows[index].window);
+        let (width, height) = logical_client_size(&window);
+        let hit = self.windows[index]
+            .cursor
+            .and_then(|(x, y)| pointer_hit(x, y, width, height));
+        if hit == Some(PointerHit::Resize) {
+            if let Some(cursor) = self.windows[index].cursor {
+                // Курсор не ограничиваем окном: иначе его нельзя вывести за край
+                // и окно получается только уменьшить.
+                self.corner = Some(CornerResize {
+                    window_id: window.id(),
+                    anchor: cursor,
+                    width,
+                    height,
+                });
+                return;
+            }
+        }
+        let _ = window.drag_window();
+    }
+
+    fn update_patch_cursor(&self, index: usize) {
+        let window = &self.windows[index].window;
+        let resizing = self
+            .corner
+            .as_ref()
+            .is_some_and(|corner| corner.window_id == window.id());
+        let (width, height) = logical_client_size(window);
+        let icon = if resizing {
+            CursorIcon::NwseResize
+        } else {
+            match self.windows[index]
+                .cursor
+                .and_then(|(x, y)| pointer_hit(x, y, width, height))
+            {
+                Some(PointerHit::Resize) => CursorIcon::NwseResize,
+                _ => CursorIcon::Default,
+            }
+        };
+        window.set_cursor(icon);
+    }
+
+    fn apply_corner_resize(&mut self, index: usize) {
+        let window_id = self.windows[index].window.id();
+        let Some(corner) = self.corner.as_ref() else {
+            return;
+        };
+        if corner.window_id != window_id {
+            return;
+        }
+        let Some(cursor) = self.windows[index].cursor else {
+            return;
+        };
+        let width = (corner.width as i32 + cursor.0 - corner.anchor.0).max(120) as u32;
+        let height = (corner.height as i32 + cursor.1 - corner.anchor.1).max(80) as u32;
+        let window = Arc::clone(&self.windows[index].window);
+        let _ = window.request_inner_size(LogicalSize::new(f64::from(width), f64::from(height)));
+    }
+
+    fn end_corner_resize(&mut self, index: usize) {
+        let window_id = self.windows[index].window.id();
+        if self
+            .corner
+            .as_ref()
+            .is_some_and(|corner| corner.window_id == window_id)
+        {
+            self.corner = None;
+            self.update_patch_cursor(index);
+        }
     }
 }
 
@@ -592,6 +782,47 @@ fn present_frame(
     buffer.fill(0x0018_1818);
     blit_frame(&mut buffer, size.width as usize, frame);
     let _ = buffer.present();
+}
+
+fn patch_add_error(frame: &ImageFrame, err: AddPatchError) -> String {
+    match err {
+        AddPatchError::TooMany => "лимит окон достигнут".to_string(),
+        AddPatchError::OverBudget {
+            frame_bytes,
+            used_bytes,
+        } => format!(
+            "кадр {}x{} занимает {frame_bytes} байт, уже занято {used_bytes} байт",
+            frame.width, frame.height
+        ),
+    }
+}
+
+fn logical_client_point(x: f64, y: f64, scale: f64) -> Option<(i32, i32)> {
+    if !x.is_finite() || !y.is_finite() || !scale.is_finite() || scale <= 0.0 {
+        return None;
+    }
+    Some((round_half_away(x / scale), round_half_away(y / scale)))
+}
+
+fn logical_client_size(window: &Window) -> (u32, u32) {
+    let scale = window.scale_factor();
+    if !scale.is_finite() || scale <= 0.0 {
+        return (120, 80);
+    }
+    let size = window.inner_size().to_logical::<f64>(scale);
+    (
+        u32::try_from(round_half_away(size.width).max(0)).unwrap_or(120),
+        u32::try_from(round_half_away(size.height).max(0)).unwrap_or(80),
+    )
+}
+
+fn round_half_away(value: f64) -> i32 {
+    let rounded = value.abs().round();
+    if value < 0.0 {
+        -(rounded as i32)
+    } else {
+        rounded as i32
+    }
 }
 
 fn physical_to_logical_i32(physical: i32, scale: f64) -> Result<i32, String> {
