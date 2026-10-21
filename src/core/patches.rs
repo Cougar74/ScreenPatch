@@ -27,11 +27,31 @@ pub enum AddPatchError {
     OverBudget { frame_bytes: usize, used_bytes: usize },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommitRefreshError {
+    OverBudget { frame_bytes: usize, used_bytes: usize },
+    SizeMismatch,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FramePair {
+    pub current: ImageFrame,
+    pub previous: Option<ImageFrame>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShownView {
+    Current,
+    Previous,
+}
+
 #[derive(Clone, Debug)]
 pub struct HeldPatch {
     pub number: u64,
     pub region: CaptureRect,
     pub frame: ImageFrame,
+    pub previous: Option<ImageFrame>,
+    pub shown: ShownView,
     pub window_x: i32,
     pub window_y: i32,
     pub window_w: u32,
@@ -42,6 +62,7 @@ pub struct HeldPatch {
 pub struct PatchManager {
     next_number: u64,
     patches: Vec<HeldPatch>,
+    windows_visible: bool,
 }
 
 pub fn fits_budget(used: usize, additional: usize) -> bool {
@@ -49,6 +70,34 @@ pub fn fits_budget(used: usize, additional: usize) -> bool {
         Some(total) => total <= PATCH_BYTE_BUDGET,
         None => false,
     }
+}
+
+pub fn commit_refresh(
+    pair: &FramePair,
+    region_width: u32,
+    region_height: u32,
+    new_frame: ImageFrame,
+    used_bytes: usize,
+) -> Result<FramePair, CommitRefreshError> {
+    if new_frame.width != region_width || new_frame.height != region_height {
+        return Err(CommitRefreshError::SizeMismatch);
+    }
+    let previous_bytes = pair
+        .previous
+        .as_ref()
+        .map(|frame| frame.pixels.len())
+        .unwrap_or(0);
+    let without_previous = used_bytes.saturating_sub(previous_bytes);
+    if !fits_budget(without_previous, new_frame.pixels.len()) {
+        return Err(CommitRefreshError::OverBudget {
+            frame_bytes: new_frame.pixels.len(),
+            used_bytes,
+        });
+    }
+    Ok(FramePair {
+        previous: Some(pair.current.clone()),
+        current: new_frame,
+    })
 }
 
 pub fn letterbox(client_w: u32, client_h: u32, image_w: u32, image_h: u32) -> Option<Letterbox> {
@@ -129,6 +178,7 @@ impl PatchManager {
         Self {
             next_number: 1,
             patches: Vec::new(),
+            windows_visible: true,
         }
     }
 
@@ -137,7 +187,17 @@ impl PatchManager {
     }
 
     pub fn used_bytes(&self) -> usize {
-        self.patches.iter().map(|patch| patch.frame.pixels.len()).sum()
+        self.patches
+            .iter()
+            .map(|patch| {
+                patch.frame.pixels.len()
+                    + patch
+                        .previous
+                        .as_ref()
+                        .map(|frame| frame.pixels.len())
+                        .unwrap_or(0)
+            })
+            .sum()
     }
 
     pub fn get(&self, number: u64) -> Option<&HeldPatch> {
@@ -167,6 +227,8 @@ impl PatchManager {
             number,
             region,
             frame,
+            previous: None,
+            shown: ShownView::Current,
             window_x: 0,
             window_y: 0,
             window_w: 0,
@@ -193,6 +255,70 @@ impl PatchManager {
             patch.window_w = width;
             patch.window_h = height;
         }
+    }
+
+    pub fn commit_refresh(
+        &mut self,
+        number: u64,
+        frame: ImageFrame,
+    ) -> Result<(), CommitRefreshError> {
+        let Some(patch) = self.patches.iter().find(|patch| patch.number == number) else {
+            return Err(CommitRefreshError::SizeMismatch);
+        };
+        let pair = FramePair {
+            current: patch.frame.clone(),
+            previous: patch.previous.clone(),
+        };
+        let region_width = patch.region.width;
+        let region_height = patch.region.height;
+        let next = commit_refresh(&pair, region_width, region_height, frame, self.used_bytes())?;
+        let Some(patch) = self.patches.iter_mut().find(|patch| patch.number == number) else {
+            return Err(CommitRefreshError::SizeMismatch);
+        };
+        patch.previous = next.previous;
+        patch.frame = next.current;
+        patch.shown = ShownView::Current;
+        Ok(())
+    }
+
+    pub fn toggle_shown(&mut self, number: u64) -> bool {
+        let Some(patch) = self.patches.iter_mut().find(|patch| patch.number == number) else {
+            return false;
+        };
+        if patch.previous.is_none() {
+            patch.shown = ShownView::Current;
+            return false;
+        }
+        patch.shown = match patch.shown {
+            ShownView::Current => ShownView::Previous,
+            ShownView::Previous => ShownView::Current,
+        };
+        true
+    }
+
+    pub fn shown_frame(&self, number: u64) -> Option<&ImageFrame> {
+        let patch = self.get(number)?;
+        match patch.shown {
+            ShownView::Current => Some(&patch.frame),
+            ShownView::Previous => Some(patch.previous.as_ref().unwrap_or(&patch.frame)),
+        }
+    }
+
+    pub fn set_windows_visible(&mut self, visible: bool) {
+        self.windows_visible = visible;
+    }
+
+    #[allow(dead_code)]
+    pub fn windows_visible(&self) -> bool {
+        self.windows_visible
+    }
+
+    pub fn close_all(&mut self, confirmed: bool) -> bool {
+        if !confirmed {
+            return false;
+        }
+        self.patches.clear();
+        true
     }
 
     pub fn replace_frame(&mut self, number: u64, frame: ImageFrame) -> bool {

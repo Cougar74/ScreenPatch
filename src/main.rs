@@ -1,24 +1,36 @@
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
+use global_hotkey::{
+    hotkey::{Code, HotKey, Modifiers},
+    GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState,
+};
+use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem};
+use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition};
 use winit::event::{ElementState, MouseButton, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, EventLoop};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{CursorGrabMode, CursorIcon, Window, WindowAttributes, WindowId, WindowLevel};
 use windows::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 
+use screenpatch::core::commands::{panel_hit, PanelAction};
 use screenpatch::core::geometry::{
     logical_to_physical_px, logical_window_size, place_window, CaptureRect, LogicalRect,
 };
-use screenpatch::core::patches::{pointer_hit, render_patch, AddPatchError, PatchManager, PointerHit};
+use screenpatch::core::patches::{
+    layout_client, letterbox, AddPatchError, CommitRefreshError, PatchManager,
+};
 use screenpatch::core::refresh::{fingerprints_match, refresh_current, ImageFrame};
-use screenpatch::core::selection::{compose_overlay, crop_frame, normalize_drag, physical_cursor_point, selection_accepted};
+use screenpatch::core::selection::{
+    compose_overlay, crop_frame, normalize_drag, physical_cursor_point, selection_accepted,
+};
 use screenpatch::platform::{
-    capture_monitor_region, hwnd_from_window, list_displays, try_exclude_from_capture,
+    acquire_single_instance, capture_monitor_region, choose_png_path, confirm_close_all,
+    draw_strip, hwnd_from_window, list_displays, suggested_png_name, try_exclude_from_capture,
     wait_until_hidden, DisplayInfo, Hwnd,
 };
 
@@ -78,6 +90,10 @@ struct App {
     corner: Option<CornerResize>,
     started: bool,
     startup_error: Option<String>,
+    tray: Option<TrayIcon>,
+    menu_items: Vec<MenuItem>,
+    hotkeys: Option<GlobalHotKeyManager>,
+    hotkey_id: u32,
 }
 
 fn main() {
@@ -88,12 +104,14 @@ fn main() {
 }
 
 fn run() -> Result<(), String> {
+    if !acquire_single_instance() {
+        eprintln!("ScreenPatch уже запущен");
+        return Ok(());
+    }
     enable_per_monitor_dpi();
-    let displays = list_displays().map_err(|err| err.message)?;
-    let prepared = prepare_overlays(&displays)?;
     let event_loop = EventLoop::new().map_err(|err| format!("не удалось создать цикл событий: {err}"))?;
     let mut app = App {
-        prepared: Some(prepared),
+        prepared: None,
         overlays: Vec::new(),
         windows: Vec::new(),
         patches: PatchManager::new(),
@@ -101,6 +119,10 @@ fn run() -> Result<(), String> {
         corner: None,
         started: false,
         startup_error: None,
+        tray: None,
+        menu_items: Vec::new(),
+        hotkeys: None,
+        hotkey_id: 0,
     };
     event_loop
         .run_app(&mut app)
@@ -152,10 +174,15 @@ impl ApplicationHandler for App {
             return;
         }
         self.started = true;
-        if let Err(err) = self.open_overlays(event_loop) {
+        event_loop.set_control_flow(ControlFlow::Wait);
+        if let Err(err) = self.install_shell() {
             self.startup_error = Some(err);
             event_loop.exit();
         }
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.poll_shell(event_loop);
     }
 
     fn window_event(
@@ -176,7 +203,7 @@ impl ApplicationHandler for App {
             return;
         };
         match event {
-            WindowEvent::CloseRequested => self.close_patch(index, event_loop),
+            WindowEvent::CloseRequested => self.close_patch(index),
             WindowEvent::KeyboardInput {
                 event,
                 is_synthetic,
@@ -188,7 +215,7 @@ impl ApplicationHandler for App {
                     return;
                 }
                 match event.logical_key {
-                    Key::Named(NamedKey::Escape) => self.close_patch(index, event_loop),
+                    Key::Named(NamedKey::Escape) => self.close_patch(index),
                     Key::Character(text) if text.eq_ignore_ascii_case("r") => self.refresh(index),
                     Key::Character(text) if text.eq_ignore_ascii_case("s") => {
                         self.begin_selection(event_loop)
@@ -288,9 +315,6 @@ impl App {
                 }
                 self.overlays
                     .retain(|overlay| overlay.window.id() != window_id);
-                if self.overlays.is_empty() && self.windows.is_empty() {
-                    event_loop.exit();
-                }
             }
             WindowEvent::KeyboardInput {
                 event,
@@ -560,21 +584,27 @@ impl App {
             .iter()
             .filter_map(|patch| hwnd_from_window(&patch.window))
             .collect();
-        let restore_windows: Vec<Arc<Window>> = self
+        let restore_windows: Vec<(Arc<Window>, bool)> = self
             .windows
             .iter()
-            .map(|patch| Arc::clone(&patch.window))
+            .map(|patch| {
+                (
+                    Arc::clone(&patch.window),
+                    patch.window.is_visible().unwrap_or(true),
+                )
+            })
             .collect();
         if hide {
-            for window in &restore_windows {
+            for (window, _) in &restore_windows {
                 window.set_visible(false);
             }
         }
         self.windows[index].refreshing = true;
         let current = self.windows[index].frame.clone();
         let monitor_for_log = monitor_id.clone();
-        let next = refresh_current(
-            current.clone(),
+        let mut captured = None;
+        let _ = refresh_current(
+            current,
             true,
             hide,
             || {
@@ -587,7 +617,10 @@ impl App {
                     return Err(());
                 }
                 match capture_monitor_region(&monitor_for_log, region) {
-                    Ok(frame) => Ok(frame),
+                    Ok(frame) => {
+                        captured = Some(frame.clone());
+                        Ok(frame)
+                    }
                     Err(err) => {
                         log_refresh_cancel(&monitor_for_log, region, &err.message);
                         Err(())
@@ -595,36 +628,65 @@ impl App {
                 }
             },
             move || {
-                for window in &restore_windows {
-                    window.set_visible(true);
+                for (window, visible) in &restore_windows {
+                    window.set_visible(*visible);
                 }
             },
         );
         self.windows[index].refreshing = false;
-        if next != current {
-            let number = self.windows[index].number;
-            self.patches.replace_frame(number, next.clone());
-            self.windows[index].frame = next;
-            self.windows[index].window.request_redraw();
+        let Some(frame) = captured else {
+            return;
+        };
+        let number = self.windows[index].number;
+        match self.patches.commit_refresh(number, frame.clone()) {
+            Ok(()) => {
+                self.windows[index].frame = frame;
+                self.windows[index].window.request_redraw();
+            }
+            Err(CommitRefreshError::OverBudget {
+                frame_bytes,
+                used_bytes,
+            }) => {
+                eprintln!(
+                    "не удалось обновить снимок {number}: кадр {}x{} занимает {frame_bytes} байт, уже занято {used_bytes} байт, монитор id={monitor_id}",
+                    frame.width, frame.height
+                );
+            }
+            Err(CommitRefreshError::SizeMismatch) => {
+                eprintln!(
+                    "не удалось обновить снимок {number}: размер кадра {}x{} не совпал с прямоугольником {}x{}, монитор id={monitor_id}",
+                    frame.width, frame.height, region.width, region.height
+                );
+            }
         }
     }
 
     fn paint_patch(&mut self, index: usize) {
         let window = Arc::clone(&self.windows[index].window);
         let size = window.inner_size();
-        let frame = render_patch(&self.windows[index].frame, size.width, size.height);
+        let number = self.windows[index].number;
+        let shown = self
+            .patches
+            .shown_frame(number)
+            .cloned()
+            .unwrap_or_else(|| self.windows[index].frame.clone());
+        let before_enabled = self
+            .patches
+            .get(number)
+            .is_some_and(|patch| patch.previous.is_some());
+        let scale = window.scale_factor();
+        let strip = ((48.0 * scale).round() as u32).min(size.height);
+        let labels = draw_strip(size.width, strip, before_enabled);
+        let frame = compose_patch(&shown, size.width, size.height, strip, &labels);
         present_frame(&window, &mut self.windows[index].surface, &frame);
     }
 
-    fn dismiss_overlays(&mut self, event_loop: &ActiveEventLoop) {
+    fn dismiss_overlays(&mut self, _event_loop: &ActiveEventLoop) {
         self.drag = None;
         self.overlays.clear();
-        if self.windows.is_empty() {
-            event_loop.exit();
-        }
     }
 
-    fn close_patch(&mut self, index: usize, event_loop: &ActiveEventLoop) {
+    fn close_patch(&mut self, index: usize) {
         let number = self.windows[index].number;
         let window_id = self.windows[index].window.id();
         if self
@@ -636,9 +698,6 @@ impl App {
         }
         self.patches.close(number);
         self.windows.remove(index);
-        if self.windows.is_empty() && self.overlays.is_empty() {
-            event_loop.exit();
-        }
     }
 
     fn begin_selection(&mut self, event_loop: &ActiveEventLoop) {
@@ -661,17 +720,22 @@ impl App {
     }
 
     fn capture_prepared(&mut self) -> Result<Vec<PreparedOverlay>, String> {
-        let hidden: Vec<Arc<Window>> = self
+        let hidden: Vec<(Arc<Window>, bool)> = self
             .windows
             .iter()
             .filter(|patch| !patch.affinity)
-            .map(|patch| Arc::clone(&patch.window))
+            .map(|patch| {
+                (
+                    Arc::clone(&patch.window),
+                    patch.window.is_visible().unwrap_or(true),
+                )
+            })
             .collect();
         let hwnds: Vec<Hwnd> = hidden
             .iter()
-            .filter_map(|window| hwnd_from_window(window))
+            .filter_map(|(window, _)| hwnd_from_window(window))
             .collect();
-        for window in &hidden {
+        for (window, _) in &hidden {
             window.set_visible(false);
         }
         let result = (|| {
@@ -681,8 +745,8 @@ impl App {
             let displays = list_displays().map_err(|err| err.message)?;
             prepare_overlays(&displays)
         })();
-        for window in &hidden {
-            window.set_visible(true);
+        for (window, visible) in &hidden {
+            window.set_visible(*visible);
         }
         result
     }
@@ -690,23 +754,34 @@ impl App {
     fn begin_patch_pointer(&mut self, index: usize) {
         let window = Arc::clone(&self.windows[index].window);
         let (width, height) = logical_client_size(&window);
-        let hit = self.windows[index]
-            .cursor
-            .and_then(|(x, y)| pointer_hit(x, y, width, height));
-        if hit == Some(PointerHit::Resize) {
-            if let Some(cursor) = self.windows[index].cursor {
+        let (width, height) = layout_client(width, height);
+        let Some((x, y)) = self.windows[index].cursor else {
+            return;
+        };
+        match panel_hit(x, y, width, height) {
+            PanelAction::Resize => {
                 // Курсор не ограничиваем окном: иначе его нельзя вывести за край
                 // и окно получается только уменьшить.
                 self.corner = Some(CornerResize {
                     window_id: window.id(),
-                    anchor: cursor,
+                    anchor: (x, y),
                     width,
                     height,
                 });
-                return;
             }
+            PanelAction::Drag => {
+                let _ = window.drag_window();
+            }
+            PanelAction::Refresh => self.refresh(index),
+            PanelAction::BeforeAfter => {
+                let number = self.windows[index].number;
+                let _ = self.patches.toggle_shown(number);
+                window.request_redraw();
+            }
+            PanelAction::Copy => self.copy_shown(index),
+            PanelAction::Save => self.save_shown(index),
+            PanelAction::Close => self.close_patch(index),
         }
-        let _ = window.drag_window();
     }
 
     fn update_patch_cursor(&self, index: usize) {
@@ -716,14 +791,15 @@ impl App {
             .as_ref()
             .is_some_and(|corner| corner.window_id == window.id());
         let (width, height) = logical_client_size(window);
+        let (width, height) = layout_client(width, height);
         let icon = if resizing {
             CursorIcon::NwseResize
         } else {
             match self.windows[index]
                 .cursor
-                .and_then(|(x, y)| pointer_hit(x, y, width, height))
+                .map(|(x, y)| panel_hit(x, y, width, height))
             {
-                Some(PointerHit::Resize) => CursorIcon::NwseResize,
+                Some(PanelAction::Resize) => CursorIcon::NwseResize,
                 _ => CursorIcon::Default,
             }
         };
@@ -757,6 +833,188 @@ impl App {
             self.corner = None;
             self.update_patch_cursor(index);
         }
+    }
+
+    fn install_shell(&mut self) -> Result<(), String> {
+        let menu = Menu::new();
+        let items = vec![
+            MenuItem::with_id("new", "Новый снимок", true, None),
+            MenuItem::with_id("show", "Показать все", true, None),
+            MenuItem::with_id("hide", "Скрыть все", true, None),
+            MenuItem::with_id("close-all", "Закрыть все снимки", true, None),
+            MenuItem::with_id("exit", "Выход", true, None),
+        ];
+        let refs: Vec<&dyn tray_icon::menu::IsMenuItem> =
+            items.iter().map(|item| item as _).collect();
+        menu.append_items(&refs)
+            .map_err(|err| format!("не удалось собрать меню значка: {err}"))?;
+        let icon = Icon::from_rgba(vec![0x3a, 0x7c, 0xff, 0xff].repeat(32 * 32), 32, 32)
+            .map_err(|err| format!("не удалось создать значок: {err}"))?;
+        let tray = TrayIconBuilder::new()
+            .with_menu(Box::new(menu))
+            .with_tooltip("ScreenPatch")
+            .with_icon(icon)
+            .build()
+            .map_err(|err| format!("не удалось создать значок в области уведомлений: {err}"))?;
+        self.menu_items = items;
+        self.tray = Some(tray);
+        match register_hotkey() {
+            Ok((manager, id)) => {
+                self.hotkeys = Some(manager);
+                self.hotkey_id = id;
+            }
+            Err(err) => eprintln!(
+                "сочетание Ctrl+Shift+S занято, новый снимок доступен из значка: {err}"
+            ),
+        }
+        Ok(())
+    }
+
+    fn poll_shell(&mut self, event_loop: &ActiveEventLoop) {
+        while let Ok(event) = MenuEvent::receiver().try_recv() {
+            self.menu_command(event_loop, &event.id);
+        }
+        while let Ok(event) = GlobalHotKeyEvent::receiver().try_recv() {
+            if self.hotkeys.is_some()
+                && event.state == HotKeyState::Pressed
+                && event.id == self.hotkey_id
+            {
+                self.begin_selection(event_loop);
+            }
+        }
+    }
+
+    fn menu_command(&mut self, event_loop: &ActiveEventLoop, id: &MenuId) {
+        if id == "new" {
+            self.begin_selection(event_loop);
+        } else if id == "show" {
+            self.set_patch_visibility(true);
+        } else if id == "hide" {
+            self.set_patch_visibility(false);
+        } else if id == "close-all" {
+            self.close_all_patches();
+        } else if id == "exit" {
+            self.exit_app(event_loop);
+        }
+    }
+
+    fn set_patch_visibility(&mut self, visible: bool) {
+        self.patches.set_windows_visible(visible);
+        for patch in &self.windows {
+            patch.window.set_visible(visible);
+        }
+    }
+
+    fn close_all_patches(&mut self) {
+        if self.windows.is_empty() {
+            return;
+        }
+        let parent = hwnd_from_window(&self.windows[0].window);
+        if !confirm_close_all(parent) {
+            return;
+        }
+        self.corner = None;
+        self.windows.clear();
+        self.patches.close_all(true);
+    }
+
+    fn exit_app(&mut self, event_loop: &ActiveEventLoop) {
+        self.drag = None;
+        self.corner = None;
+        self.overlays.clear();
+        self.windows.clear();
+        self.patches.close_all(true);
+        self.tray = None;
+        event_loop.exit();
+    }
+
+    fn copy_shown(&self, index: usize) {
+        let number = self.windows[index].number;
+        let Some(frame) = self.patches.shown_frame(number) else {
+            return;
+        };
+        let image = arboard::ImageData {
+            width: frame.width as usize,
+            height: frame.height as usize,
+            bytes: std::borrow::Cow::Borrowed(frame.pixels.as_ref()),
+        };
+        match arboard::Clipboard::new().and_then(|mut clipboard| clipboard.set_image(image)) {
+            Ok(()) => {}
+            Err(err) => eprintln!("не удалось скопировать снимок {number}: {err}"),
+        }
+    }
+
+    fn save_shown(&self, index: usize) {
+        let number = self.windows[index].number;
+        let Some(frame) = self.patches.shown_frame(number).cloned() else {
+            return;
+        };
+        let parent = hwnd_from_window(&self.windows[index].window);
+        let path = match choose_png_path(parent, &suggested_png_name()) {
+            Ok(Some(path)) => path,
+            Ok(None) => return,
+            Err(err) => {
+                eprintln!("не удалось сохранить снимок {number}: {err}");
+                return;
+            }
+        };
+        if let Err(err) = image::save_buffer(
+            &path,
+            frame.pixels.as_ref(),
+            frame.width,
+            frame.height,
+            image::ExtendedColorType::Rgba8,
+        ) {
+            eprintln!("не удалось сохранить снимок {number}: {err}");
+        }
+    }
+}
+
+fn register_hotkey() -> Result<(GlobalHotKeyManager, u32), String> {
+    let hotkey = HotKey::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyS);
+    let id = hotkey.id();
+    let manager = GlobalHotKeyManager::new().map_err(|err| err.to_string())?;
+    manager.register(hotkey).map_err(|err| err.to_string())?;
+    Ok((manager, id))
+}
+
+fn compose_patch(
+    frame: &ImageFrame,
+    width: u32,
+    height: u32,
+    strip: u32,
+    labels: &[u8],
+) -> ImageFrame {
+    let width = width.max(1);
+    let height = height.max(1);
+    let mut pixels = vec![24u8, 24, 24, 255].repeat(width as usize * height as usize);
+    let image_height = height.saturating_sub(strip);
+    if let Some(placed) = letterbox(width, image_height, frame.width, frame.height) {
+        for local_y in 0..placed.height {
+            let source_y =
+                ((u64::from(local_y) * u64::from(frame.height)) / u64::from(placed.height)) as u32;
+            for local_x in 0..placed.width {
+                let source_x =
+                    ((u64::from(local_x) * u64::from(frame.width)) / u64::from(placed.width)) as u32;
+                let source = ((source_y * frame.width + source_x) * 4) as usize;
+                let destination_y = strip + placed.y + local_y;
+                let destination =
+                    ((destination_y * width + placed.x + local_x) * 4) as usize;
+                pixels[destination..destination + 4]
+                    .copy_from_slice(&frame.pixels[source..source + 4]);
+            }
+        }
+    }
+    let strip_bytes = (width as usize)
+        .saturating_mul(strip.min(height) as usize)
+        .saturating_mul(4)
+        .min(labels.len())
+        .min(pixels.len());
+    pixels[..strip_bytes].copy_from_slice(&labels[..strip_bytes]);
+    ImageFrame {
+        pixels: Arc::from(pixels.into_boxed_slice()),
+        width,
+        height,
     }
 }
 

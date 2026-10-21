@@ -6,7 +6,11 @@ publish = false
 description = "ScreenPatch step 1: floating captures on mixed-DPI monitors"
 
 [dependencies]
+arboard = "3.7.0"
+global-hotkey = "0.9.0"
+image = "0.25.10"
 softbuffer = "0.4"
-windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_HiDpi", "Win32_UI_WindowsAndMessaging"] }
+tray-icon = "0.26.1"
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Security", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_UI_Controls_Dialogs", "Win32_UI_HiDpi", "Win32_UI_WindowsAndMessaging"] }
 winit = "0.30.13"
 xcap = { version = "0.9.8", features = ["wgc"] }

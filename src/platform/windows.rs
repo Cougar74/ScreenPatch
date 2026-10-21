@@ -1,14 +1,30 @@
 use std::ffi::c_void;
+use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use windows::core::BOOL;
-use windows::Win32::Foundation::{HWND, LPARAM, RECT};
-use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use windows::Win32::Graphics::Gdi::{EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO};
-use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, IsWindowVisible, MsgWaitForMultipleObjects, PeekMessageW,
-    SetWindowDisplayAffinity, TranslateMessage, MSG, PM_REMOVE, QS_ALLINPUT, WDA_EXCLUDEFROMCAPTURE,
+use windows::core::{w, BOOL, PCWSTR, PWSTR};
+use windows::Win32::Foundation::{
+    CloseHandle, GetLastError, SetLastError, COLORREF, ERROR_ALREADY_EXISTS, HWND, LPARAM, RECT,
+    WIN32_ERROR,
 };
+use windows::Win32::Graphics::Gdi::{
+    CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, DrawTextW, EnumDisplayMonitors,
+    GetMonitorInfoW, GetStockObject, SelectObject, SetBkMode, SetTextColor, BITMAPINFO,
+    BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, DT_CENTER, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
+    HDC, HMONITOR, MONITORINFO, TRANSPARENT,
+};
+use windows::Win32::System::SystemInformation::GetLocalTime;
+use windows::Win32::System::Threading::CreateMutexW;
+use windows::Win32::UI::Controls::Dialogs::{
+    CommDlgExtendedError, GetSaveFileNameW, OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST, OPENFILENAMEW,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
+    DispatchMessageW, IsWindowVisible, MessageBoxW, MsgWaitForMultipleObjects, PeekMessageW,
+    SetWindowDisplayAffinity, TranslateMessage, IDYES, MB_ICONQUESTION, MB_YESNO, MSG, PM_REMOVE,
+    QS_ALLINPUT, WDA_EXCLUDEFROMCAPTURE,
+};
+use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use xcap::Monitor;
 
 use crate::capture::service::{frame_from_rgba, CaptureError};
@@ -266,6 +282,182 @@ fn work_rects() -> Vec<WorkRect> {
             })
         })
         .collect()
+}
+
+pub fn acquire_single_instance() -> bool {
+    static INSTANCE_LOCK: OnceLock<isize> = OnceLock::new();
+    unsafe {
+        SetLastError(WIN32_ERROR(0));
+        match CreateMutexW(None, false, w!("Local\\ScreenPatch")) {
+            Ok(handle) => {
+                if GetLastError() == ERROR_ALREADY_EXISTS {
+                    let _ = CloseHandle(handle);
+                    false
+                } else {
+                    let _ = INSTANCE_LOCK.set(handle.0 as isize);
+                    true
+                }
+            }
+            Err(err) => {
+                eprintln!("не удалось проверить единственный экземпляр: {err}");
+                true
+            }
+        }
+    }
+}
+
+pub fn confirm_close_all(parent: Option<Hwnd>) -> bool {
+    unsafe {
+        let owner = parent
+            .map(|hwnd| HWND(hwnd.0 as *mut c_void))
+            .unwrap_or_default();
+        MessageBoxW(
+            Some(owner),
+            w!("Закрыть все снимки и освободить их кадры?"),
+            w!("ScreenPatch"),
+            MB_YESNO | MB_ICONQUESTION,
+        ) == IDYES
+    }
+}
+
+pub fn suggested_png_name() -> String {
+    let time = unsafe { GetLocalTime() };
+    format!(
+        "ScreenPatch_{:04}-{:02}-{:02}_{:02}-{:02}-{:02}.png",
+        time.wYear, time.wMonth, time.wDay, time.wHour, time.wMinute, time.wSecond
+    )
+}
+
+pub fn choose_png_path(parent: Option<Hwnd>, suggested: &str) -> Result<Option<PathBuf>, String> {
+    let mut file: Vec<u16> = suggested.encode_utf16().chain(std::iter::once(0)).collect();
+    file.resize(1024, 0);
+    let filter: Vec<u16> = "PNG\0*.png\0\0".encode_utf16().collect();
+    let mut dialog = OPENFILENAMEW {
+        lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
+        hwndOwner: parent
+            .map(|hwnd| HWND(hwnd.0 as *mut c_void))
+            .unwrap_or_default(),
+        lpstrFilter: PCWSTR(filter.as_ptr()),
+        lpstrFile: PWSTR(file.as_mut_ptr()),
+        nMaxFile: file.len() as u32,
+        lpstrDefExt: w!("png"),
+        Flags: OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST,
+        ..Default::default()
+    };
+    let chosen = unsafe { GetSaveFileNameW(&mut dialog) };
+    if !chosen.as_bool() {
+        let code = unsafe { CommDlgExtendedError() };
+        if code.0 == 0 {
+            return Ok(None);
+        }
+        return Err(format!("диалог сохранения вернул ошибку {code:?}"));
+    }
+    let end = file.iter().position(|unit| *unit == 0).unwrap_or(file.len());
+    Ok(Some(PathBuf::from(String::from_utf16_lossy(&file[..end]))))
+}
+
+pub fn draw_strip(width: u32, height: u32, before_after_enabled: bool) -> Vec<u8> {
+    let pixels = (width as usize).saturating_mul(height as usize).saturating_mul(4);
+    let mut rgba = vec![32u8, 32, 32, 255].repeat(pixels / 4);
+    if width == 0 || height == 0 {
+        return rgba;
+    }
+    unsafe {
+        let dc = CreateCompatibleDC(None);
+        if dc.is_invalid() {
+            return rgba;
+        }
+        let info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: width as i32,
+                biHeight: -(height as i32),
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut bits: *mut c_void = std::ptr::null_mut();
+        let bitmap = CreateDIBSection(Some(dc), &info, DIB_RGB_COLORS, &mut bits, None, 0);
+        if bitmap.is_err() || bits.is_null() {
+            let _ = DeleteDC(dc);
+            return rgba;
+        }
+        let bitmap = bitmap.unwrap_or_default();
+        let previous = SelectObject(dc, bitmap.into());
+        let source = std::slice::from_raw_parts_mut(bits as *mut u8, pixels);
+        for pixel in source.chunks_exact_mut(4) {
+            pixel.copy_from_slice(&[32, 32, 32, 255]);
+        }
+        let font = GetStockObject(windows::Win32::Graphics::Gdi::DEFAULT_GUI_FONT);
+        let previous_font = SelectObject(dc, font);
+        let _ = SetBkMode(dc, TRANSPARENT);
+        let row = height / 3;
+        let mid = width / 2;
+        let cells = [
+            (0, 0, mid, row, "Обновить", true),
+            (mid, 0, width, row, "До/после", before_after_enabled),
+            (0, row, mid, row.saturating_mul(2), "Копировать", true),
+            (mid, row, width, row.saturating_mul(2), "Сохранить", true),
+            (0, row.saturating_mul(2), width, height, "Закрыть", true),
+        ];
+        for (left, top, right, bottom, text, enabled) in cells {
+            let color = if enabled { 0x00FF_FFFF } else { 0x0080_8080 };
+            let _ = SetTextColor(dc, COLORREF(color));
+            let mut wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+            let mut bounds = RECT {
+                left: left as i32,
+                top: top as i32,
+                right: right as i32,
+                bottom: bottom as i32,
+            };
+            let _ = DrawTextW(
+                dc,
+                &mut wide,
+                &mut bounds,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+            );
+        }
+        for (rgba_pixel, bgra) in rgba.chunks_exact_mut(4).zip(source.chunks_exact(4)) {
+            rgba_pixel[0] = bgra[2];
+            rgba_pixel[1] = bgra[1];
+            rgba_pixel[2] = bgra[0];
+            rgba_pixel[3] = 255;
+        }
+        let _ = SelectObject(dc, previous_font);
+        let _ = SelectObject(dc, previous);
+        let _ = DeleteObject(bitmap.into());
+        let _ = DeleteDC(dc);
+    }
+    stroke_strip(&mut rgba, width, height);
+    rgba
+}
+
+fn stroke_strip(pixels: &mut [u8], width: u32, height: u32) {
+    let row = height / 3;
+    let mid = width / 2;
+    let paint = |pixels: &mut [u8], x: u32, y: u32| {
+        if x >= width || y >= height {
+            return;
+        }
+        let index = ((y * width + x) * 4) as usize;
+        pixels[index..index + 3].copy_from_slice(&[70, 70, 70]);
+    };
+    for x in 0..width {
+        paint(pixels, x, 0);
+        paint(pixels, x, row);
+        paint(pixels, x, row.saturating_mul(2));
+        paint(pixels, x, height.saturating_sub(1));
+    }
+    for y in 0..height {
+        paint(pixels, 0, y);
+        if y < row.saturating_mul(2) {
+            paint(pixels, mid, y);
+        }
+        paint(pixels, width.saturating_sub(1), y);
+    }
 }
 
 unsafe extern "system" fn enum_monitors(
