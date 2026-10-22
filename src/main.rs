@@ -19,6 +19,7 @@ use windows::Win32::UI::HiDpi::{
 use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSMICON};
 
 use screenpatch::core::commands::{client_hit, PanelAction};
+use screenpatch::core::language::{self, Language};
 use screenpatch::core::geometry::{
     logical_client_keeping_physical, logical_to_physical_px, logical_window_size,
     one_to_one_physical_size, place_window, shift_into_work_area, CaptureRect, LogicalRect,
@@ -34,8 +35,9 @@ use screenpatch::core::selection::{
 };
 use screenpatch::platform::{
     acquire_single_instance, capture_monitor_region, choose_png_path, confirm_close_all,
-    draw_strip, hwnd_from_window, list_displays, suggested_png_name, try_exclude_from_capture,
-    wait_until_hidden, DisplayInfo, Hwnd,
+    draw_strip, hwnd_from_window, list_displays, read_saved_language, suggested_png_name,
+    system_ui_language, try_exclude_from_capture, wait_until_hidden, write_saved_language,
+    DisplayInfo, Hwnd,
 };
 
 struct PreparedOverlay {
@@ -100,6 +102,7 @@ struct App {
     menu_items: Vec<MenuItem>,
     hotkeys: Option<GlobalHotKeyManager>,
     hotkey_id: u32,
+    language: Language,
 }
 
 fn main() {
@@ -110,12 +113,26 @@ fn main() {
 }
 
 fn run() -> Result<(), String> {
-    if !acquire_single_instance() {
-        eprintln!("ScreenPatch уже запущен");
+    let language = match read_saved_language() {
+        Ok(Some(language)) => language,
+        Ok(None) => system_ui_language(),
+        Err(err) => {
+            let fallback = system_ui_language();
+            eprintln!(
+                "{}",
+                language::render(fallback, language::LANGUAGE_READ_FAILED, &[("err", &err)])
+            );
+            fallback
+        }
+    };
+    if !acquire_single_instance(language) {
+        eprintln!("{}", language::text(language, language::ALREADY_RUNNING));
         return Ok(());
     }
     enable_per_monitor_dpi();
-    let event_loop = EventLoop::new().map_err(|err| format!("не удалось создать цикл событий: {err}"))?;
+    let event_loop = EventLoop::new().map_err(|err| {
+        language::render(language, language::EVENT_LOOP_CREATE_FAILED, &[("err", &err.to_string())])
+    })?;
     let mut app = App {
         prepared: None,
         overlays: Vec::new(),
@@ -129,10 +146,15 @@ fn run() -> Result<(), String> {
         menu_items: Vec::new(),
         hotkeys: None,
         hotkey_id: 0,
+        language,
     };
-    event_loop
-        .run_app(&mut app)
-        .map_err(|err| format!("цикл событий завершился с ошибкой: {err}"))?;
+    event_loop.run_app(&mut app).map_err(|err| {
+        language::render(
+            language,
+            language::EVENT_LOOP_RUN_FAILED,
+            &[("err", &err.to_string())],
+        )
+    })?;
     if let Some(err) = app.startup_error {
         return Err(err);
     }
@@ -145,7 +167,10 @@ fn enable_per_monitor_dpi() {
     }
 }
 
-fn prepare_overlays(displays: &[DisplayInfo]) -> Result<Vec<PreparedOverlay>, String> {
+fn prepare_overlays(
+    language: Language,
+    displays: &[DisplayInfo],
+) -> Result<Vec<PreparedOverlay>, String> {
     let mut readiness = Vec::new();
     let mut prepared = Vec::new();
     let mut capture_error = None;
@@ -160,7 +185,7 @@ fn prepare_overlays(displays: &[DisplayInfo]) -> Result<Vec<PreparedOverlay>, St
                 width: display.physical_width,
                 height: display.physical_height,
             };
-            match capture_monitor_region(&display.id, region) {
+            match capture_monitor_region(language, &display.id, region) {
                 Ok(frame) => {
                     frame_ready = true;
                     prepared.push(PreparedOverlay {
@@ -185,12 +210,21 @@ fn prepare_overlays(displays: &[DisplayInfo]) -> Result<Vec<PreparedOverlay>, St
     }
     match selection_ready(&readiness) {
         Ok(()) => Ok(prepared),
-        Err(SelectionAbort::NoMonitors) => Err("мониторы не найдены".to_string()),
-        Err(SelectionAbort::BadScale { id }) => Err(format!("масштаб монитора {id} некорректен")),
-        Err(SelectionAbort::EmptySize { id }) => Err(format!("размер монитора {id} некорректен")),
-        Err(SelectionAbort::CaptureFailed { id }) => Err(format!(
-            "не удалось снять монитор {id}: {}",
-            capture_error.unwrap_or_default()
+        Err(SelectionAbort::NoMonitors) => Err(language::text(language, language::NO_MONITORS).to_string()),
+        Err(SelectionAbort::BadScale { id }) => Err(language::render(
+            language,
+            language::BAD_MONITOR_SCALE,
+            &[("id", &id)],
+        )),
+        Err(SelectionAbort::EmptySize { id }) => Err(language::render(
+            language,
+            language::BAD_MONITOR_SIZE,
+            &[("id", &id)],
+        )),
+        Err(SelectionAbort::CaptureFailed { id }) => Err(language::render(
+            language,
+            language::CAPTURE_MONITOR_FAILED,
+            &[("id", &id), ("err", &capture_error.unwrap_or_default())],
         )),
     }
 }
@@ -285,8 +319,8 @@ impl ApplicationHandler for App {
                             .request_inner_size(PhysicalSize::new(width, height));
                     }
                     None => eprintln!(
-                        "масштаб окна некорректен, размер снимка {} не изменён",
-                        self.windows[index].number
+                        "{}",
+                        self.fill(language::BAD_WINDOW_SCALE, &[("number", &self.windows[index].number.to_string())])
                     ),
                 }
             }
@@ -297,6 +331,14 @@ impl ApplicationHandler for App {
 }
 
 impl App {
+    fn say(&self, phrase: language::Phrase) -> &'static str {
+        language::text(self.language, phrase)
+    }
+
+    fn fill(&self, phrase: language::Phrase, pairs: &[(&str, &str)]) -> String {
+        language::render(self.language, phrase, pairs)
+    }
+
     fn overlay_index(&self, window_id: WindowId) -> Option<usize> {
         self.overlays
             .iter()
@@ -307,15 +349,15 @@ impl App {
         let prepared = self
             .prepared
             .take()
-            .ok_or_else(|| "слои уже созданы".to_string())?;
+            .ok_or_else(|| self.say(language::LAYERS_ALREADY).to_string())?;
         for item in prepared {
             let (logical_w, logical_h) = logical_window_size(
                 item.display.physical_width,
                 item.display.physical_height,
                 item.display.scale,
             )
-            .ok_or_else(|| format!("масштаб монитора {} некорректен", item.display.id))?;
-            let attributes = apply_window_icon(
+            .ok_or_else(|| self.fill(language::BAD_MONITOR_SCALE, &[("id", &item.display.id)]))?;
+            let attributes = apply_window_icon(self.language,
                 WindowAttributes::default()
                     .with_title(format!("ScreenPatch {}", item.display.id))
                     .with_decorations(false)
@@ -328,14 +370,14 @@ impl App {
                     )),
             );
             let window = Arc::new(event_loop.create_window(attributes).map_err(|err| {
-                format!("не удалось создать слой монитора {}: {err}", item.display.id)
+                self.fill(language::OVERLAY_CREATE_FAILED, &[("id", &item.display.id), ("err", &err.to_string())])
             })?);
             window.set_cursor(CursorIcon::Crosshair);
             let context = softbuffer::Context::new(Arc::clone(&window)).map_err(|err| {
-                format!("не удалось создать буфер слоя {}: {err}", item.display.id)
+                self.fill(language::OVERLAY_BUFFER_FAILED, &[("id", &item.display.id), ("err", &err.to_string())])
             })?;
             let surface = softbuffer::Surface::new(&context, Arc::clone(&window)).map_err(|err| {
-                format!("не удалось создать поверхность слоя {}: {err}", item.display.id)
+                self.fill(language::OVERLAY_SURFACE_FAILED, &[("id", &item.display.id), ("err", &err.to_string())])
             })?;
             window.request_redraw();
             self.overlays.push(OverlayWindow {
@@ -487,8 +529,17 @@ impl App {
         };
         let Some(cropped) = crop_frame(&self.overlays[index].frame, rect) else {
             eprintln!(
-                "не удалось вырезать область, монитор id={}, прямоугольник=({},{},{}x{})",
-                self.overlays[index].display.id, rect.x, rect.y, rect.width, rect.height
+                "{}",
+                self.fill(
+                    language::CROP_FAILED,
+                    &[
+                        ("id", &self.overlays[index].display.id),
+                        ("x", &rect.x.to_string()),
+                        ("y", &rect.y.to_string()),
+                        ("w", &rect.width.to_string()),
+                        ("h", &rect.height.to_string()),
+                    ],
+                )
             );
             self.request_overlay_redraw(window_id);
             return;
@@ -496,8 +547,18 @@ impl App {
         let display = self.overlays[index].display.clone();
         if let Err(err) = self.spawn_patch(event_loop, &display, rect, cropped) {
             eprintln!(
-                "не удалось создать окно снимка: {err}, монитор id={}, прямоугольник=({},{},{}x{})",
-                display.id, rect.x, rect.y, rect.width, rect.height
+                "{}",
+                self.fill(
+                    language::PATCH_WINDOW_FAILED,
+                    &[
+                        ("err", &err),
+                        ("id", &display.id),
+                        ("x", &rect.x.to_string()),
+                        ("y", &rect.y.to_string()),
+                        ("w", &rect.width.to_string()),
+                        ("h", &rect.height.to_string()),
+                    ],
+                )
             );
             self.request_overlay_redraw(window_id);
             return;
@@ -514,30 +575,31 @@ impl App {
     ) -> Result<(), String> {
         self.patches
             .check(&frame)
-            .map_err(|err| patch_add_error(&frame, err))?;
+            .map_err(|err| patch_add_error(self.language, &frame, err))?;
         let (region_w, region_h) =
             logical_window_size(frame.width, frame.height, display.scale)
-                .ok_or_else(|| format!("масштаб монитора {} некорректен", display.id))?;
+                .ok_or_else(|| self.fill(language::BAD_MONITOR_SCALE, &[("id", &display.id)]))?;
         let (physical_w, physical_h) =
             one_to_one_physical_size(frame.width, frame.height, display.scale, false)
-                .ok_or_else(|| format!("масштаб монитора {} некорректен", display.id))?;
+                .ok_or_else(|| self.fill(language::BAD_MONITOR_SCALE, &[("id", &display.id)]))?;
         let (logical_w, logical_h) =
             logical_client_keeping_physical(physical_w, physical_h, display.scale)
-                .ok_or_else(|| format!("масштаб монитора {} некорректен", display.id))?;
+                .ok_or_else(|| self.fill(language::BAD_MONITOR_SCALE, &[("id", &display.id)]))?;
         let capture = LogicalRect {
-            x: physical_to_logical_i32(region.x, display.scale)?,
-            y: physical_to_logical_i32(region.y, display.scale)?,
+            x: physical_to_logical_i32(self.language, region.x, display.scale)?,
+            y: physical_to_logical_i32(self.language, region.y, display.scale)?,
             width: region_w,
             height: region_h,
         };
         let (local_x, local_y) = place_window(capture, logical_w, logical_h, display.work);
         let position_x = display.origin_x
             + logical_to_physical_px(local_x, display.scale)
-                .ok_or_else(|| format!("не удалось перевести положение окна монитора {}", display.id))?;
+                .ok_or_else(|| self.fill(language::WINDOW_POS_FAILED, &[("id", &display.id)]))?;
         let position_y = display.origin_y
             + logical_to_physical_px(local_y, display.scale)
-                .ok_or_else(|| format!("не удалось перевести положение окна монитора {}", display.id))?;
+                .ok_or_else(|| self.fill(language::WINDOW_POS_FAILED, &[("id", &display.id)]))?;
         let attributes = apply_window_icon(
+            self.language,
             WindowAttributes::default()
                 .with_title("ScreenPatch")
                 .with_decorations(false)
@@ -549,21 +611,21 @@ impl App {
         let window = Arc::new(
             event_loop
                 .create_window(attributes)
-                .map_err(|err| format!("не удалось создать окно: {err}"))?,
+                .map_err(|err| self.fill(language::WINDOW_CREATE_FAILED, &[("err", &err.to_string())]))?,
         );
         let context = softbuffer::Context::new(Arc::clone(&window))
-            .map_err(|err| format!("не удалось создать буфер окна: {err}"))?;
+            .map_err(|err| self.fill(language::WINDOW_BUFFER_FAILED, &[("err", &err.to_string())]))?;
         let surface = softbuffer::Surface::new(&context, Arc::clone(&window))
-            .map_err(|err| format!("не удалось создать поверхность окна: {err}"))?;
-        let hwnd = hwnd_from_window(&window).ok_or_else(|| "у окна нет дескриптора Win32".to_string())?;
+            .map_err(|err| self.fill(language::WINDOW_SURFACE_FAILED, &[("err", &err.to_string())]))?;
+        let hwnd = hwnd_from_window(&window).ok_or_else(|| self.say(language::NO_HWND).to_string())?;
         let affinity = try_exclude_from_capture(hwnd);
         let number = match self.patches.add(region, frame.clone()) {
             Ok(number) => number,
-            Err(err) => return Err(patch_add_error(&frame, err)),
+            Err(err) => return Err(patch_add_error(self.language, &frame, err)),
         };
         window.set_title(&format!("ScreenPatch {number}"));
         let _ = window.request_inner_size(PhysicalSize::new(physical_w, physical_h));
-        log_monitor(display, region, affinity);
+        log_monitor(self.language, display, region, affinity);
         window.request_redraw();
         self.windows.push(PatchWindow {
             number,
@@ -610,7 +672,7 @@ impl App {
 
     fn refresh(&mut self, index: usize) {
         if self.windows[index].refreshing {
-            eprintln!("обновление уже выполняется");
+            eprintln!("{}", self.say(language::REFRESH_IN_PROGRESS));
             return;
         }
         let monitor_id = self.windows[index].fingerprint_id.clone();
@@ -623,10 +685,10 @@ impl App {
             physical_height: self.windows[index].physical_height,
             scale: self.windows[index].scale,
         };
-        let displays = match list_displays() {
+        let displays = match list_displays(self.language) {
             Ok(displays) => displays,
             Err(err) => {
-                log_refresh_cancel(&monitor_id, region, &err.message);
+                log_refresh_cancel(self.language, &monitor_id, region, &err.message);
                 return;
             }
         };
@@ -637,11 +699,11 @@ impl App {
         match refresh_gate(&saved, &monitors) {
             Ok(()) => {}
             Err(RefreshBlock::MonitorMissing) => {
-                log_refresh_cancel(&monitor_id, region, "монитор больше не подключён");
+                log_refresh_cancel(self.language, &monitor_id, region, self.say(language::MONITOR_MISSING));
                 return;
             }
             Err(RefreshBlock::GeometryChanged) => {
-                log_refresh_cancel(&monitor_id, region, "геометрия монитора изменилась");
+                log_refresh_cancel(self.language, &monitor_id, region, self.say(language::GEOMETRY_CHANGED));
                 return;
             }
         }
@@ -678,19 +740,20 @@ impl App {
             || {
                 if hide && wait_until_hidden(&hwnds).is_err() {
                     log_refresh_cancel(
+                        self.language,
                         &monitor_for_log,
                         region,
-                        "не удалось подтвердить скрытие окон",
+                        self.say(language::HIDE_FAILED),
                     );
                     return Err(());
                 }
-                match capture_monitor_region(&monitor_for_log, region) {
+                match capture_monitor_region(self.language, &monitor_for_log, region) {
                     Ok(frame) => {
                         captured = Some(frame.clone());
                         Ok(frame)
                     }
                     Err(err) => {
-                        log_refresh_cancel(&monitor_for_log, region, &err.message);
+                        log_refresh_cancel(self.language, &monitor_for_log, region, &err.message);
                         Err(())
                     }
                 }
@@ -716,14 +779,34 @@ impl App {
                 used_bytes,
             }) => {
                 eprintln!(
-                    "не удалось обновить снимок {number}: кадр {}x{} занимает {frame_bytes} байт, уже занято {used_bytes} байт, монитор id={monitor_id}",
-                    frame.width, frame.height
+                    "{}",
+                    self.fill(
+                        language::REFRESH_BUDGET,
+                        &[
+                            ("number", &number.to_string()),
+                            ("w", &frame.width.to_string()),
+                            ("h", &frame.height.to_string()),
+                            ("bytes", &frame_bytes.to_string()),
+                            ("used", &used_bytes.to_string()),
+                            ("id", &monitor_id),
+                        ],
+                    )
                 );
             }
             Err(CommitRefreshError::SizeMismatch) => {
                 eprintln!(
-                    "не удалось обновить снимок {number}: размер кадра {}x{} не совпал с прямоугольником {}x{}, монитор id={monitor_id}",
-                    frame.width, frame.height, region.width, region.height
+                    "{}",
+                    self.fill(
+                        language::REFRESH_SIZE,
+                        &[
+                            ("number", &number.to_string()),
+                            ("w", &frame.width.to_string()),
+                            ("h", &frame.height.to_string()),
+                            ("rw", &region.width.to_string()),
+                            ("rh", &region.height.to_string()),
+                            ("id", &monitor_id),
+                        ],
+                    )
                 );
             }
         }
@@ -752,7 +835,18 @@ impl App {
         let labels = if strip == 0 {
             Vec::new()
         } else {
-            draw_strip(size.width, strip, before_enabled)
+            draw_strip(
+                size.width,
+                strip,
+                before_enabled,
+                [
+                    self.say(language::STRIP_REFRESH),
+                    self.say(language::STRIP_BEFORE_AFTER),
+                    self.say(language::STRIP_COPY),
+                    self.say(language::STRIP_SAVE),
+                    self.say(language::STRIP_CLOSE),
+                ],
+            )
         };
         let frame = compose_patch(&shown, size.width, size.height, strip, &labels);
         present_frame(&window, &mut self.windows[index].surface, &frame);
@@ -777,29 +871,33 @@ impl App {
         let Some((width, height)) =
             one_to_one_physical_size(frame.width, frame.height, scale, self.windows[index].strip_visible)
         else {
-            eprintln!("масштаб окна некорректен, размер снимка {number} не изменён");
+            eprintln!("{}", self.fill(language::BAD_WINDOW_SCALE, &[("number", &number.to_string())]));
             return;
         };
         let window = Arc::clone(&self.windows[index].window);
         let _ = window.request_inner_size(PhysicalSize::new(width, height));
         self.windows[index].physical_client = (width, height);
         let Ok(position) = window.outer_position() else {
-            eprintln!("не удалось прочитать положение снимка {number}, окно оставлено на месте");
+            eprintln!("{}", self.fill(language::POSITION_UNREAD, &[("number", &number.to_string())]));
             return;
         };
-        let displays = match list_displays() {
+        let displays = match list_displays(self.language) {
             Ok(displays) => displays,
             Err(err) => {
                 eprintln!(
-                    "не удалось прочитать рабочую область снимка {number}: {}, окно оставлено на месте",
-                    err.message
+                    "{}",
+                    self.fill(
+                        language::WORK_AREA_UNREAD_ERR,
+                        &[("number", &number.to_string()), ("err", &err.message)],
+                    )
                 );
                 return;
             }
         };
         let Some(work) = work_area_for_window(position.x, position.y, width, height, &displays) else {
             eprintln!(
-                "не удалось прочитать рабочую область снимка {number}, окно оставлено на месте"
+                "{}",
+                self.fill(language::WORK_AREA_UNREAD, &[("number", &number.to_string())])
             );
             return;
         };
@@ -811,7 +909,7 @@ impl App {
         let number = self.windows[index].number;
         let scale = self.windows[index].window.scale_factor();
         let Some(strip) = logical_to_physical_px(48, scale).filter(|strip| *strip > 0) else {
-            eprintln!("масштаб окна некорректен, размер снимка {number} не изменён");
+            eprintln!("{}", self.fill(language::BAD_WINDOW_SCALE, &[("number", &number.to_string())]));
             return;
         };
         let strip = strip as u32;
@@ -852,7 +950,7 @@ impl App {
             return;
         }
         if self.patches.len() >= 10 {
-            eprintln!("лимит окон достигнут: уже открыто 10 снимков");
+            eprintln!("{}", self.say(language::WINDOW_LIMIT));
             return;
         }
         let remembered: Vec<(Arc<Window>, bool)> = self
@@ -869,12 +967,12 @@ impl App {
             Ok(prepared) => {
                 self.prepared = Some(prepared);
                 if let Err(err) = self.open_overlays(event_loop) {
-                    eprintln!("не удалось открыть слои выделения: {err}");
+                    eprintln!("{}", self.fill(language::LAYERS_FAILED, &[("err", &err)]));
                     self.abort_selection(&remembered);
                 }
             }
             Err(err) => {
-                eprintln!("не удалось начать новое выделение: {err}");
+                eprintln!("{}", self.fill(language::SELECTION_FAILED, &[("err", &err)]));
                 self.abort_selection(&remembered);
             }
         }
@@ -910,10 +1008,12 @@ impl App {
         }
         let result = (|| {
             if !hidden.is_empty() && wait_until_hidden(&hwnds).is_err() {
-                return Err("не удалось подтвердить скрытие окон".to_string());
+                return Err(self.say(language::HIDE_FAILED).to_string());
             }
-            let displays = list_displays().map_err(|err| format!("мониторы не найдены: {}", err.message))?;
-            prepare_overlays(&displays)
+            let displays = list_displays(self.language).map_err(|err| {
+                self.fill(language::MONITORS_NOT_FOUND, &[("err", &err.message)])
+            })?;
+            prepare_overlays(self.language, &displays)
         })();
         for (window, visible) in &hidden {
             window.set_visible(*visible);
@@ -1005,28 +1105,70 @@ impl App {
         }
     }
 
-    fn install_shell(&mut self) -> Result<(), String> {
+    fn tray_menu(&self) -> Result<(Menu, Vec<MenuItem>), String> {
         let menu = Menu::new();
         let items = vec![
-            MenuItem::with_id("new", "Новый снимок", true, None),
-            MenuItem::with_id("show", "Показать все", true, None),
-            MenuItem::with_id("hide", "Скрыть все", true, None),
-            MenuItem::with_id("close-all", "Закрыть все снимки", true, None),
-            MenuItem::with_id("exit", "Выход", true, None),
+            MenuItem::with_id("new", self.say(language::TRAY_NEW), true, None),
+            MenuItem::with_id("show", self.say(language::TRAY_SHOW), true, None),
+            MenuItem::with_id("hide", self.say(language::TRAY_HIDE), true, None),
+            MenuItem::with_id("close-all", self.say(language::TRAY_CLOSE_ALL), true, None),
+            MenuItem::with_id("language", self.say(language::TRAY_OTHER_LANGUAGE), true, None),
+            MenuItem::with_id("exit", self.say(language::TRAY_EXIT), true, None),
         ];
-        let refs: Vec<&dyn tray_icon::menu::IsMenuItem> =
-            items.iter().map(|item| item as _).collect();
+        let separator = tray_icon::menu::PredefinedMenuItem::separator();
+        let refs: Vec<&dyn tray_icon::menu::IsMenuItem> = vec![
+            &items[0],
+            &items[1],
+            &items[2],
+            &items[3],
+            &items[4],
+            &separator,
+            &items[5],
+        ];
         menu.append_items(&refs)
-            .map_err(|err| format!("не удалось собрать меню значка: {err}"))?;
-        let source = tray_icon_source()?;
+            .map_err(|err| self.fill(language::MENU_FAILED, &[("err", &err.to_string())]))?;
+        Ok((menu, items))
+    }
+
+    fn replace_tray_menu(&mut self) -> Result<(), String> {
+        let (menu, items) = self.tray_menu()?;
+        if let Some(tray) = &self.tray {
+            tray.set_menu(Some(Box::new(menu)));
+        }
+        self.menu_items = items;
+        Ok(())
+    }
+
+    fn switch_language(&mut self) {
+        self.language = match self.language {
+            Language::Ru => Language::En,
+            Language::En => Language::Ru,
+        };
+        if let Err(err) = write_saved_language(self.language) {
+            eprintln!(
+                "{}",
+                self.fill(language::LANGUAGE_SAVE_FAILED, &[("err", &err)])
+            );
+        }
+        if let Err(err) = self.replace_tray_menu() {
+            eprintln!("{}", err);
+        }
+        for patch in &self.windows {
+            patch.window.request_redraw();
+        }
+    }
+
+    fn install_shell(&mut self) -> Result<(), String> {
+        let (menu, items) = self.tray_menu()?;
+        let source = tray_icon_source(self.language)?;
         let icon = Icon::from_rgba(source.pixels, source.width, source.height)
-            .map_err(|err| format!("не удалось создать значок: {err}"))?;
+            .map_err(|err| self.fill(language::ICON_CREATE_FAILED, &[("err", &err.to_string())]))?;
         let tray = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
             .with_tooltip("ScreenPatch")
             .with_icon(icon)
             .build()
-            .map_err(|err| format!("не удалось создать значок в области уведомлений: {err}"))?;
+            .map_err(|err| self.fill(language::TRAY_CREATE_FAILED, &[("err", &err.to_string())]))?;
         self.menu_items = items;
         self.tray = Some(tray);
         match register_hotkey() {
@@ -1035,7 +1177,8 @@ impl App {
                 self.hotkey_id = id;
             }
             Err(err) => eprintln!(
-                "сочетание Ctrl+Shift+S занято, новый снимок доступен из значка: {err}"
+                "{}",
+                self.fill(language::HOTKEY_BUSY, &[("err", &err)])
             ),
         }
         Ok(())
@@ -1064,6 +1207,8 @@ impl App {
             self.set_patch_visibility(false);
         } else if id == "close-all" {
             self.close_all_patches();
+        } else if id == "language" {
+            self.switch_language();
         } else if id == "exit" {
             self.exit_app(event_loop);
         }
@@ -1081,7 +1226,7 @@ impl App {
             return;
         }
         let parent = hwnd_from_window(&self.windows[0].window);
-        if !confirm_close_all(parent) {
+        if !confirm_close_all(parent, self.say(language::CLOSE_ALL_QUESTION)) {
             return;
         }
         self.corner = None;
@@ -1111,7 +1256,13 @@ impl App {
         };
         match arboard::Clipboard::new().and_then(|mut clipboard| clipboard.set_image(image)) {
             Ok(()) => {}
-            Err(err) => eprintln!("не удалось скопировать снимок {number}: {err}"),
+            Err(err) => eprintln!(
+                "{}",
+                self.fill(
+                    language::COPY_FAILED,
+                    &[("number", &number.to_string()), ("err", &err.to_string())],
+                )
+            ),
         }
     }
 
@@ -1121,11 +1272,11 @@ impl App {
             return;
         };
         let parent = hwnd_from_window(&self.windows[index].window);
-        let path = match choose_png_path(parent, &suggested_png_name()) {
+        let path = match choose_png_path(self.language, parent, &suggested_png_name()) {
             Ok(Some(path)) => path,
             Ok(None) => return,
             Err(err) => {
-                eprintln!("не удалось сохранить снимок {number}: {err}");
+                eprintln!("{}", self.fill(language::SAVE_FAILED, &[("number", &number.to_string()), ("err", &err.to_string())]));
                 return;
             }
         };
@@ -1136,7 +1287,7 @@ impl App {
             frame.height,
             image::ExtendedColorType::Rgba8,
         ) {
-            eprintln!("не удалось сохранить снимок {number}: {err}");
+            eprintln!("{}", self.fill(language::SAVE_FAILED, &[("number", &number.to_string()), ("err", &err.to_string())]));
         }
     }
 }
@@ -1147,11 +1298,11 @@ struct AppIcon {
     height: u32,
 }
 
-fn app_icon() -> Result<&'static AppIcon, String> {
+fn app_icon(language: Language) -> Result<&'static AppIcon, String> {
     static ICON: OnceLock<Result<AppIcon, String>> = OnceLock::new();
     ICON.get_or_init(|| {
         let image = image::load_from_memory(include_bytes!("icon.png"))
-            .map_err(|err| format!("не удалось прочитать значок: {err}"))?;
+            .map_err(|err| language::render(language, language::ICON_READ_FAILED, &[("err", &err.to_string())]))?;
         let rgba = image.to_rgba8();
         let (width, height) = rgba.dimensions();
         Ok(AppIcon {
@@ -1164,10 +1315,10 @@ fn app_icon() -> Result<&'static AppIcon, String> {
     .map_err(Clone::clone)
 }
 
-fn tray_icon_source() -> Result<AppIcon, String> {
-    let source = app_icon()?;
+fn tray_icon_source(language: Language) -> Result<AppIcon, String> {
+    let source = app_icon(language)?;
     let image = image::RgbaImage::from_raw(source.width, source.height, source.pixels.clone())
-        .ok_or_else(|| "не удалось прочитать значок".to_string())?;
+        .ok_or_else(|| language::text(language, language::ICON_DECODE_FAILED).to_string())?;
     let (width, height) = image.dimensions();
     let mut min_x = width;
     let mut min_y = height;
@@ -1220,8 +1371,8 @@ fn tray_slot_px() -> u32 {
     u32::try_from(side).unwrap_or(32).max(32)
 }
 
-fn apply_window_icon(attributes: WindowAttributes) -> WindowAttributes {
-    let source = match app_icon() {
+fn apply_window_icon(language: Language, attributes: WindowAttributes) -> WindowAttributes {
+    let source = match app_icon(language) {
         Ok(source) => source,
         Err(err) => {
             eprintln!("{err}");
@@ -1231,7 +1382,7 @@ fn apply_window_icon(attributes: WindowAttributes) -> WindowAttributes {
     match winit::window::Icon::from_rgba(source.pixels.clone(), source.width, source.height) {
         Ok(icon) => attributes.with_window_icon(Some(icon)),
         Err(err) => {
-            eprintln!("не удалось поставить значок окна: {err}");
+            eprintln!("{}", language::render(language, language::WINDOW_ICON_FAILED, &[("err", &err.to_string())]));
             attributes
         }
     }
@@ -1309,15 +1460,21 @@ fn present_frame(
     let _ = buffer.present();
 }
 
-fn patch_add_error(frame: &ImageFrame, err: AddPatchError) -> String {
+fn patch_add_error(language: Language, frame: &ImageFrame, err: AddPatchError) -> String {
     match err {
-        AddPatchError::TooMany => "лимит окон достигнут".to_string(),
+        AddPatchError::TooMany => language::text(language, language::TOO_MANY_SHORT).to_string(),
         AddPatchError::OverBudget {
             frame_bytes,
             used_bytes,
-        } => format!(
-            "кадр {}x{} занимает {frame_bytes} байт, уже занято {used_bytes} байт",
-            frame.width, frame.height
+        } => language::render(
+            language,
+            language::FRAME_BUDGET,
+            &[
+                ("w", &frame.width.to_string()),
+                ("h", &frame.height.to_string()),
+                ("bytes", &frame_bytes.to_string()),
+                ("used", &used_bytes.to_string()),
+            ],
         ),
     }
 }
@@ -1391,37 +1548,57 @@ fn round_half_away(value: f64) -> i32 {
     }
 }
 
-fn physical_to_logical_i32(physical: i32, scale: f64) -> Result<i32, String> {
+fn physical_to_logical_i32(language: Language, physical: i32, scale: f64) -> Result<i32, String> {
     screenpatch::core::geometry::physical_to_logical_px(physical, scale)
-        .ok_or_else(|| "масштаб монитора некорректен".to_string())
+        .ok_or_else(|| language::text(language, language::BAD_SCALE_SHORT).to_string())
 }
 
-fn log_monitor(display: &DisplayInfo, region: CaptureRect, affinity: bool) {
-    let exclusion = if affinity {
-        "display-affinity"
-    } else {
-        "скрытие"
-    };
+fn log_monitor(language: Language, display: &DisplayInfo, region: CaptureRect, affinity: bool) {
+    let exclusion = language::text(
+        language,
+        if affinity {
+            language::EXCLUDED_AFFINITY
+        } else {
+            language::EXCLUDED_HIDDEN
+        },
+    );
     eprintln!(
-        "монитор id={} начало=({},{}) размер={}x{} масштаб={} прямоугольник=({},{},{}x{}) исключение={}",
-        display.id,
-        display.origin_x,
-        display.origin_y,
-        display.physical_width,
-        display.physical_height,
-        format_scale(display.scale),
-        region.x,
-        region.y,
-        region.width,
-        region.height,
-        exclusion
+        "{}",
+        language::render(
+            language,
+            language::MONITOR_LOG,
+            &[
+                ("id", &display.id),
+                ("x", &display.origin_x.to_string()),
+                ("y", &display.origin_y.to_string()),
+                ("w", &display.physical_width.to_string()),
+                ("h", &display.physical_height.to_string()),
+                ("scale", &format_scale(display.scale)),
+                ("rx", &region.x.to_string()),
+                ("ry", &region.y.to_string()),
+                ("rw", &region.width.to_string()),
+                ("rh", &region.height.to_string()),
+                ("excluded", exclusion),
+            ],
+        )
     );
 }
 
-fn log_refresh_cancel(monitor_id: &str, region: CaptureRect, reason: &str) {
+fn log_refresh_cancel(language: Language, monitor_id: &str, region: CaptureRect, reason: &str) {
     eprintln!(
-        "обновление отменено: {reason}, монитор id={monitor_id}, прямоугольник=({},{},{}x{})",
-        region.x, region.y, region.width, region.height
+        "{}",
+        language::render(
+            language,
+            language::REFRESH_CANCELLED,
+            &[
+                ("reason", reason),
+                ("id", monitor_id),
+                ("x", &region.x.to_string()),
+                ("y", &region.y.to_string()),
+                ("w", &region.width.to_string()),
+                ("h", &region.height.to_string()),
+            ],
+        )
     );
 }
 

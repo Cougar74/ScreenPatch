@@ -14,6 +14,7 @@ use windows::Win32::Graphics::Gdi::{
     BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, DT_CENTER, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
     HDC, HMONITOR, MONITORINFO, TRANSPARENT,
 };
+use windows::Win32::Globalization::GetUserDefaultUILanguage;
 use windows::Win32::System::SystemInformation::GetLocalTime;
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::Controls::Dialogs::{
@@ -29,6 +30,7 @@ use xcap::Monitor;
 
 use crate::capture::service::{frame_from_rgba, CaptureError};
 use crate::core::geometry::{physical_to_logical_px, CaptureRect, WorkArea};
+use crate::core::language::{self, Language};
 use crate::core::refresh::{ImageFrame, Fingerprint};
 
 #[derive(Clone, Debug)]
@@ -69,32 +71,61 @@ struct WorkRect {
     work_bottom: i32,
 }
 
-pub fn list_displays() -> Result<Vec<DisplayInfo>, CaptureError> {
+pub fn list_displays(language: Language) -> Result<Vec<DisplayInfo>, CaptureError> {
     let monitors = Monitor::all().map_err(|err| {
-        CaptureError::new(format!("не удалось перечислить мониторы: {err}"))
+        CaptureError::new(language::render(
+            language,
+            language::ENUM_MONITORS_FAILED,
+            &[("err", &err.to_string())],
+        ))
     })?;
     let work_rects = work_rects();
     let mut displays = Vec::new();
     for monitor in monitors {
         let id = monitor.name().map_err(|err| {
-            CaptureError::new(format!("не удалось прочитать имя монитора: {err}"))
+            CaptureError::new(language::render(
+                language,
+                language::MONITOR_NAME_FAILED,
+                &[("err", &err.to_string())],
+            ))
         })?;
         let origin_x = monitor.x().map_err(|err| {
-            CaptureError::new(format!("не удалось прочитать положение монитора {id}: {err}"))
+            CaptureError::new(language::render(
+                language,
+                language::MONITOR_ORIGIN_FAILED,
+                &[("id", &id), ("err", &err.to_string())],
+            ))
         })?;
         let origin_y = monitor.y().map_err(|err| {
-            CaptureError::new(format!("не удалось прочитать положение монитора {id}: {err}"))
+            CaptureError::new(language::render(
+                language,
+                language::MONITOR_ORIGIN_FAILED,
+                &[("id", &id), ("err", &err.to_string())],
+            ))
         })?;
         let physical_width = monitor.width().map_err(|err| {
-            CaptureError::new(format!("не удалось прочитать размер монитора {id}: {err}"))
+            CaptureError::new(language::render(
+                language,
+                language::MONITOR_SIZE_FAILED,
+                &[("id", &id), ("err", &err.to_string())],
+            ))
         })?;
         let physical_height = monitor.height().map_err(|err| {
-            CaptureError::new(format!("не удалось прочитать размер монитора {id}: {err}"))
+            CaptureError::new(language::render(
+                language,
+                language::MONITOR_SIZE_FAILED,
+                &[("id", &id), ("err", &err.to_string())],
+            ))
         })?;
         let scale = quantize_scale(monitor.scale_factor().map_err(|err| {
-            CaptureError::new(format!("не удалось прочитать масштаб монитора {id}: {err}"))
+            CaptureError::new(language::render(
+                language,
+                language::MONITOR_SCALE_FAILED,
+                &[("id", &id), ("err", &err.to_string())],
+            ))
         })?);
         let work = logical_work_area(
+            language,
             origin_x,
             origin_y,
             physical_width,
@@ -116,30 +147,37 @@ pub fn list_displays() -> Result<Vec<DisplayInfo>, CaptureError> {
 }
 
 pub fn capture_monitor_region(
+    language: Language,
     monitor_id: &str,
     region: CaptureRect,
 ) -> Result<ImageFrame, CaptureError> {
     if region.x < 0 || region.y < 0 {
-        return Err(CaptureError::new(
-            "прямоугольник захвата выходит в отрицательные координаты монитора",
-        ));
+        return Err(CaptureError::new(language::text(language, language::NEGATIVE_CAPTURE)));
     }
     if crate::core::geometry::frame_byte_len(region.width, region.height).is_none() {
-        return Err(CaptureError::new(
-            "размер кадра превышает 64 МиБ или переполняет расчёт буфера",
-        ));
+        return Err(CaptureError::new(language::text(language, language::FRAME_TOO_BIG)));
     }
     let monitors = Monitor::all().map_err(|err| {
-        CaptureError::new(format!("не удалось перечислить мониторы: {err}"))
+        CaptureError::new(language::render(
+            language,
+            language::ENUM_MONITORS_FAILED,
+            &[("err", &err.to_string())],
+        ))
     })?;
     let monitor = monitors
         .into_iter()
         .find(|monitor| monitor.name().ok().as_deref() == Some(monitor_id))
-        .ok_or_else(|| CaptureError::new(format!("монитор {monitor_id} не найден")))?;
+        .ok_or_else(|| {
+            CaptureError::new(language::render(
+                language,
+                language::MONITOR_NOT_FOUND,
+                &[("id", monitor_id)],
+            ))
+        })?;
     let image = monitor
         .capture_region(region.x as u32, region.y as u32, region.width, region.height)
         .map_err(|err| CaptureError::new(err.to_string()))?;
-    frame_from_rgba(image.width(), image.height(), image.into_raw())
+    frame_from_rgba(language, image.width(), image.height(), image.into_raw())
 }
 
 pub fn try_exclude_from_capture(hwnd: Hwnd) -> bool {
@@ -202,6 +240,7 @@ fn quantize_scale(scale: f32) -> f64 {
 }
 
 fn logical_work_area(
+    language: Language,
     origin_x: i32,
     origin_y: i32,
     physical_width: u32,
@@ -230,14 +269,14 @@ fn logical_work_area(
     let rel_w = right.saturating_sub(left).max(0) as u32;
     let rel_h = bottom.saturating_sub(top).max(0) as u32;
     let x = physical_to_logical_px(rel_x, scale).ok_or_else(|| {
-        CaptureError::new("масштаб монитора не позволяет перевести рабочую область")
+        CaptureError::new(language::text(language, language::WORK_AREA_SCALE))
     })?;
     let y = physical_to_logical_px(rel_y, scale).ok_or_else(|| {
-        CaptureError::new("масштаб монитора не позволяет перевести рабочую область")
+        CaptureError::new(language::text(language, language::WORK_AREA_SCALE))
     })?;
     let (width, height) = crate::core::geometry::logical_window_size(rel_w, rel_h, scale)
         .ok_or_else(|| {
-            CaptureError::new("масштаб монитора не позволяет перевести рабочую область")
+            CaptureError::new(language::text(language, language::WORK_AREA_SCALE))
         })?;
     Ok(WorkArea {
         x,
@@ -284,7 +323,42 @@ fn work_rects() -> Vec<WorkRect> {
         .collect()
 }
 
-pub fn acquire_single_instance() -> bool {
+pub fn system_ui_language() -> Language {
+    let language = unsafe { GetUserDefaultUILanguage() };
+    if u32::from(language) & 0x3ff == 0x19 {
+        Language::Ru
+    } else {
+        Language::En
+    }
+}
+
+pub fn read_saved_language() -> Result<Option<Language>, String> {
+    let Some(root) = std::env::var_os("LOCALAPPDATA") else {
+        return Err("LOCALAPPDATA".to_string());
+    };
+    let path = PathBuf::from(root).join("ScreenPatch").join("language.txt");
+    match std::fs::read_to_string(&path) {
+        Ok(text) if text.trim().is_empty() => Ok(None),
+        Ok(text) => language::parse_saved_language(&text)
+            .map(Some)
+            .ok_or_else(|| text.trim().to_string()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+pub fn write_saved_language(language: Language) -> Result<(), String> {
+    let root = std::env::var_os("LOCALAPPDATA").ok_or_else(|| "LOCALAPPDATA".to_string())?;
+    let folder = PathBuf::from(root).join("ScreenPatch");
+    std::fs::create_dir_all(&folder).map_err(|err| err.to_string())?;
+    let word = match language {
+        Language::Ru => "ru\n",
+        Language::En => "en\n",
+    };
+    std::fs::write(folder.join("language.txt"), word).map_err(|err| err.to_string())
+}
+
+pub fn acquire_single_instance(language: Language) -> bool {
     static INSTANCE_LOCK: OnceLock<isize> = OnceLock::new();
     unsafe {
         SetLastError(WIN32_ERROR(0));
@@ -299,21 +373,29 @@ pub fn acquire_single_instance() -> bool {
                 }
             }
             Err(err) => {
-                eprintln!("не удалось проверить единственный экземпляр: {err}");
+                eprintln!(
+                    "{}",
+                    language::render(
+                        language,
+                        language::SINGLE_INSTANCE_FAILED,
+                        &[("err", &err.to_string())]
+                    )
+                );
                 true
             }
         }
     }
 }
 
-pub fn confirm_close_all(parent: Option<Hwnd>) -> bool {
+pub fn confirm_close_all(parent: Option<Hwnd>, question: &str) -> bool {
     unsafe {
         let owner = parent
             .map(|hwnd| HWND(hwnd.0 as *mut c_void))
             .unwrap_or_default();
+        let question: Vec<u16> = question.encode_utf16().chain(std::iter::once(0)).collect();
         MessageBoxW(
             Some(owner),
-            w!("Закрыть все снимки и освободить их кадры?"),
+            PCWSTR(question.as_ptr()),
             w!("ScreenPatch"),
             MB_YESNO | MB_ICONQUESTION,
         ) == IDYES
@@ -328,7 +410,11 @@ pub fn suggested_png_name() -> String {
     )
 }
 
-pub fn choose_png_path(parent: Option<Hwnd>, suggested: &str) -> Result<Option<PathBuf>, String> {
+pub fn choose_png_path(
+    language: Language,
+    parent: Option<Hwnd>,
+    suggested: &str,
+) -> Result<Option<PathBuf>, String> {
     let mut file: Vec<u16> = suggested.encode_utf16().chain(std::iter::once(0)).collect();
     file.resize(1024, 0);
     let filter: Vec<u16> = "PNG\0*.png\0\0".encode_utf16().collect();
@@ -350,13 +436,22 @@ pub fn choose_png_path(parent: Option<Hwnd>, suggested: &str) -> Result<Option<P
         if code.0 == 0 {
             return Ok(None);
         }
-        return Err(format!("диалог сохранения вернул ошибку {code:?}"));
+        return Err(language::render(
+            language,
+            language::SAVE_DIALOG_FAILED,
+            &[("code", &format!("{code:?}"))],
+        ));
     }
     let end = file.iter().position(|unit| *unit == 0).unwrap_or(file.len());
     Ok(Some(PathBuf::from(String::from_utf16_lossy(&file[..end]))))
 }
 
-pub fn draw_strip(width: u32, height: u32, before_after_enabled: bool) -> Vec<u8> {
+pub fn draw_strip(
+    width: u32,
+    height: u32,
+    before_after_enabled: bool,
+    labels: [&str; 5],
+) -> Vec<u8> {
     let pixels = (width as usize).saturating_mul(height as usize).saturating_mul(4);
     let mut rgba = vec![32u8, 32, 32, 255].repeat(pixels / 4);
     if width == 0 || height == 0 {
@@ -397,11 +492,11 @@ pub fn draw_strip(width: u32, height: u32, before_after_enabled: bool) -> Vec<u8
         let row = height / 3;
         let mid = width / 2;
         let cells = [
-            (0, 0, mid, row, "Обновить", true),
-            (mid, 0, width, row, "До/после", before_after_enabled),
-            (0, row, mid, row.saturating_mul(2), "Копировать", true),
-            (mid, row, width, row.saturating_mul(2), "Сохранить", true),
-            (0, row.saturating_mul(2), width, height, "Закрыть", true),
+            (0, 0, mid, row, labels[0], true),
+            (mid, 0, width, row, labels[1], before_after_enabled),
+            (0, row, mid, row.saturating_mul(2), labels[2], true),
+            (mid, row, width, row.saturating_mul(2), labels[3], true),
+            (0, row.saturating_mul(2), width, height, labels[4], true),
         ];
         for (left, top, right, bottom, text, enabled) in cells {
             let color = if enabled { 0x00FF_FFFF } else { 0x0080_8080 };
