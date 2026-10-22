@@ -8,7 +8,7 @@ use global_hotkey::{
 use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 use winit::application::ApplicationHandler;
-use winit::dpi::{LogicalSize, PhysicalPosition};
+use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, NamedKey};
@@ -16,13 +16,16 @@ use winit::window::{CursorGrabMode, CursorIcon, Window, WindowAttributes, Window
 use windows::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
+use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSMICON};
 
-use screenpatch::core::commands::{panel_hit, PanelAction};
+use screenpatch::core::commands::{client_hit, PanelAction};
 use screenpatch::core::geometry::{
-    logical_to_physical_px, logical_window_size, place_window, CaptureRect, LogicalRect,
+    logical_client_keeping_physical, logical_to_physical_px, logical_window_size,
+    one_to_one_physical_size, place_window, shift_into_work_area, CaptureRect, LogicalRect,
+    WorkArea,
 };
 use screenpatch::core::patches::{
-    layout_client, letterbox, AddPatchError, CommitRefreshError, PatchManager,
+    letterbox, AddPatchError, CommitRefreshError, PatchManager,
 };
 use screenpatch::core::refresh::{refresh_current, refresh_gate, ImageFrame, RefreshBlock};
 use screenpatch::core::selection::{
@@ -80,6 +83,8 @@ struct PatchWindow {
     scale: f64,
     affinity: bool,
     refreshing: bool,
+    strip_visible: bool,
+    physical_client: (u32, u32),
 }
 
 struct App {
@@ -239,6 +244,7 @@ impl ApplicationHandler for App {
                 match event.logical_key {
                     Key::Named(NamedKey::Escape) => self.close_patch(index),
                     Key::Character(text) if text.eq_ignore_ascii_case("r") => self.refresh(index),
+                    Key::Character(text) if text == "1" => self.restore_actual_size(index),
                     Key::Character(text) if text.eq_ignore_ascii_case("s") => {
                         self.begin_selection(event_loop)
                     }
@@ -257,13 +263,32 @@ impl ApplicationHandler for App {
                 ..
             } => self.begin_patch_pointer(index),
             WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Right,
+                ..
+            } => self.toggle_strip(index),
+            WindowEvent::MouseInput {
                 state: ElementState::Released,
                 button: MouseButton::Left,
                 ..
             } => self.end_corner_resize(index),
-            WindowEvent::Resized(_) => self.windows[index].window.request_redraw(),
-            WindowEvent::ScaleFactorChanged { .. } => {
+            WindowEvent::Resized(_) => {
+                self.remember_physical_client(index);
                 self.windows[index].window.request_redraw();
+            }
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                let (width, height) = self.windows[index].physical_client;
+                match logical_client_keeping_physical(width, height, scale_factor) {
+                    Some(_) => {
+                        let _ = self.windows[index]
+                            .window
+                            .request_inner_size(PhysicalSize::new(width, height));
+                    }
+                    None => eprintln!(
+                        "масштаб окна некорректен, размер снимка {} не изменён",
+                        self.windows[index].number
+                    ),
+                }
             }
             WindowEvent::RedrawRequested => self.paint_patch(index),
             _ => {}
@@ -493,7 +518,12 @@ impl App {
         let (region_w, region_h) =
             logical_window_size(frame.width, frame.height, display.scale)
                 .ok_or_else(|| format!("масштаб монитора {} некорректен", display.id))?;
-        let (logical_w, logical_h) = (region_w.max(120), region_h.max(80));
+        let (physical_w, physical_h) =
+            one_to_one_physical_size(frame.width, frame.height, display.scale, false)
+                .ok_or_else(|| format!("масштаб монитора {} некорректен", display.id))?;
+        let (logical_w, logical_h) =
+            logical_client_keeping_physical(physical_w, physical_h, display.scale)
+                .ok_or_else(|| format!("масштаб монитора {} некорректен", display.id))?;
         let capture = LogicalRect {
             x: physical_to_logical_i32(region.x, display.scale)?,
             y: physical_to_logical_i32(region.y, display.scale)?,
@@ -513,8 +543,7 @@ impl App {
                 .with_decorations(false)
                 .with_resizable(false)
                 .with_window_level(WindowLevel::AlwaysOnTop)
-                .with_min_inner_size(LogicalSize::new(120.0, 80.0))
-                .with_inner_size(LogicalSize::new(logical_w as f64, logical_h as f64))
+                .with_inner_size(PhysicalSize::new(physical_w, physical_h))
                 .with_position(PhysicalPosition::new(position_x, position_y)),
         );
         let window = Arc::new(
@@ -533,6 +562,7 @@ impl App {
             Err(err) => return Err(patch_add_error(&frame, err)),
         };
         window.set_title(&format!("ScreenPatch {number}"));
+        let _ = window.request_inner_size(PhysicalSize::new(physical_w, physical_h));
         log_monitor(display, region, affinity);
         window.request_redraw();
         self.windows.push(PatchWindow {
@@ -551,6 +581,8 @@ impl App {
             scale: display.scale,
             affinity,
             refreshing: false,
+            strip_visible: false,
+            physical_client: (physical_w, physical_h),
         });
         Ok(())
     }
@@ -711,10 +743,89 @@ impl App {
             .get(number)
             .is_some_and(|patch| patch.previous.is_some());
         let scale = window.scale_factor();
-        let strip = ((48.0 * scale).round() as u32).min(size.height);
-        let labels = draw_strip(size.width, strip, before_enabled);
+        let strip = if self.windows[index].strip_visible {
+            logical_to_physical_px(48, scale).unwrap_or(0).max(0) as u32
+        } else {
+            0
+        };
+        let strip = strip.min(size.height);
+        let labels = if strip == 0 {
+            Vec::new()
+        } else {
+            draw_strip(size.width, strip, before_enabled)
+        };
         let frame = compose_patch(&shown, size.width, size.height, strip, &labels);
         present_frame(&window, &mut self.windows[index].surface, &frame);
+        self.remember_physical_client(index);
+    }
+
+    fn remember_physical_client(&mut self, index: usize) {
+        let size = self.windows[index].window.inner_size();
+        if size.width > 0 && size.height > 0 {
+            self.windows[index].physical_client = (size.width, size.height);
+        }
+    }
+
+    fn restore_actual_size(&mut self, index: usize) {
+        let number = self.windows[index].number;
+        let frame = self
+            .patches
+            .shown_frame(number)
+            .cloned()
+            .unwrap_or_else(|| self.windows[index].frame.clone());
+        let scale = self.windows[index].window.scale_factor();
+        let Some((width, height)) =
+            one_to_one_physical_size(frame.width, frame.height, scale, self.windows[index].strip_visible)
+        else {
+            eprintln!("масштаб окна некорректен, размер снимка {number} не изменён");
+            return;
+        };
+        let window = Arc::clone(&self.windows[index].window);
+        let _ = window.request_inner_size(PhysicalSize::new(width, height));
+        self.windows[index].physical_client = (width, height);
+        let Ok(position) = window.outer_position() else {
+            eprintln!("не удалось прочитать положение снимка {number}, окно оставлено на месте");
+            return;
+        };
+        let displays = match list_displays() {
+            Ok(displays) => displays,
+            Err(err) => {
+                eprintln!(
+                    "не удалось прочитать рабочую область снимка {number}: {}, окно оставлено на месте",
+                    err.message
+                );
+                return;
+            }
+        };
+        let Some(work) = work_area_for_window(position.x, position.y, width, height, &displays) else {
+            eprintln!(
+                "не удалось прочитать рабочую область снимка {number}, окно оставлено на месте"
+            );
+            return;
+        };
+        let (x, y) = shift_into_work_area(position.x, position.y, width, height, work);
+        window.set_outer_position(PhysicalPosition::new(x, y));
+    }
+
+    fn toggle_strip(&mut self, index: usize) {
+        let number = self.windows[index].number;
+        let scale = self.windows[index].window.scale_factor();
+        let Some(strip) = logical_to_physical_px(48, scale).filter(|strip| *strip > 0) else {
+            eprintln!("масштаб окна некорректен, размер снимка {number} не изменён");
+            return;
+        };
+        let strip = strip as u32;
+        let (width, height) = self.windows[index].physical_client;
+        let height = if self.windows[index].strip_visible {
+            height.saturating_sub(strip).max(1)
+        } else {
+            height.saturating_add(strip)
+        };
+        self.windows[index].strip_visible = !self.windows[index].strip_visible;
+        let window = Arc::clone(&self.windows[index].window);
+        let _ = window.request_inner_size(PhysicalSize::new(width, height));
+        self.windows[index].physical_client = (width, height);
+        window.request_redraw();
     }
 
     fn dismiss_overlays(&mut self, _event_loop: &ActiveEventLoop) {
@@ -813,11 +924,11 @@ impl App {
     fn begin_patch_pointer(&mut self, index: usize) {
         let window = Arc::clone(&self.windows[index].window);
         let (width, height) = logical_client_size(&window);
-        let (width, height) = layout_client(width, height);
+        let strip_visible = self.windows[index].strip_visible;
         let Some((x, y)) = self.windows[index].cursor else {
             return;
         };
-        match panel_hit(x, y, width, height) {
+        match client_hit(x, y, width, height, strip_visible) {
             PanelAction::Resize => {
                 // Курсор не ограничиваем окном: иначе его нельзя вывести за край
                 // и окно получается только уменьшить.
@@ -850,13 +961,13 @@ impl App {
             .as_ref()
             .is_some_and(|corner| corner.window_id == window.id());
         let (width, height) = logical_client_size(window);
-        let (width, height) = layout_client(width, height);
+        let strip_visible = self.windows[index].strip_visible;
         let icon = if resizing {
             CursorIcon::NwseResize
         } else {
             match self.windows[index]
                 .cursor
-                .map(|(x, y)| panel_hit(x, y, width, height))
+                .map(|(x, y)| client_hit(x, y, width, height, strip_visible))
             {
                 Some(PanelAction::Resize) => CursorIcon::NwseResize,
                 _ => CursorIcon::Default,
@@ -907,8 +1018,8 @@ impl App {
             items.iter().map(|item| item as _).collect();
         menu.append_items(&refs)
             .map_err(|err| format!("не удалось собрать меню значка: {err}"))?;
-        let source = app_icon()?;
-        let icon = Icon::from_rgba(source.pixels.clone(), source.width, source.height)
+        let source = tray_icon_source()?;
+        let icon = Icon::from_rgba(source.pixels, source.width, source.height)
             .map_err(|err| format!("не удалось создать значок: {err}"))?;
         let tray = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
@@ -1053,6 +1164,62 @@ fn app_icon() -> Result<&'static AppIcon, String> {
     .map_err(Clone::clone)
 }
 
+fn tray_icon_source() -> Result<AppIcon, String> {
+    let source = app_icon()?;
+    let image = image::RgbaImage::from_raw(source.width, source.height, source.pixels.clone())
+        .ok_or_else(|| "не удалось прочитать значок".to_string())?;
+    let (width, height) = image.dimensions();
+    let mut min_x = width;
+    let mut min_y = height;
+    let mut max_x = 0;
+    let mut max_y = 0;
+    let mut found = false;
+    for (x, y, pixel) in image.enumerate_pixels() {
+        if pixel[3] == 0 {
+            continue;
+        }
+        found = true;
+        min_x = min_x.min(x);
+        min_y = min_y.min(y);
+        max_x = max_x.max(x);
+        max_y = max_y.max(y);
+    }
+    let cropped = if found {
+        image::imageops::crop_imm(&image, min_x, min_y, max_x - min_x + 1, max_y - min_y + 1)
+            .to_image()
+    } else {
+        image
+    };
+    let crop_w = cropped.width();
+    let crop_h = cropped.height();
+    let side = crop_w.max(crop_h).max(1);
+    let mut square = image::RgbaImage::from_pixel(side, side, image::Rgba([0, 0, 0, 0]));
+    image::imageops::overlay(
+        &mut square,
+        &cropped,
+        i64::from((side - crop_w) / 2),
+        i64::from((side - crop_h) / 2),
+    );
+    let target = tray_slot_px();
+    let resized = image::imageops::resize(
+        &square,
+        target,
+        target,
+        image::imageops::FilterType::Lanczos3,
+    );
+    let (width, height) = resized.dimensions();
+    Ok(AppIcon {
+        pixels: resized.into_raw(),
+        width,
+        height,
+    })
+}
+
+fn tray_slot_px() -> u32 {
+    let side = unsafe { GetSystemMetrics(SM_CXSMICON) };
+    u32::try_from(side).unwrap_or(32).max(32)
+}
+
 fn apply_window_icon(attributes: WindowAttributes) -> WindowAttributes {
     let source = match app_icon() {
         Ok(source) => source,
@@ -1153,6 +1320,47 @@ fn patch_add_error(frame: &ImageFrame, err: AddPatchError) -> String {
             frame.width, frame.height
         ),
     }
+}
+
+fn work_area_for_window(
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    displays: &[DisplayInfo],
+) -> Option<WorkArea> {
+    let center_x = x.saturating_add(i32::try_from(width / 2).unwrap_or(i32::MAX));
+    let center_y = y.saturating_add(i32::try_from(height / 2).unwrap_or(i32::MAX));
+    if let Some(display) = displays.iter().find(|display| {
+        center_x >= display.origin_x
+            && center_y >= display.origin_y
+            && center_x < display.origin_x.saturating_add(display.physical_width as i32)
+            && center_y < display.origin_y.saturating_add(display.physical_height as i32)
+    }) {
+        return Some(display.work);
+    }
+    let mut best: Option<(i64, WorkArea)> = None;
+    for display in displays {
+        let area = overlap_area(display, x, y, width, height);
+        if area > 0 && best.as_ref().is_none_or(|(best_area, _)| area > *best_area) {
+            best = Some((area, display.work));
+        }
+    }
+    best.map(|(_, work)| work)
+}
+
+fn overlap_area(display: &DisplayInfo, x: i32, y: i32, width: u32, height: u32) -> i64 {
+    let left = x.max(display.origin_x);
+    let top = y.max(display.origin_y);
+    let right = x
+        .saturating_add(width as i32)
+        .min(display.origin_x.saturating_add(display.physical_width as i32));
+    let bottom = y
+        .saturating_add(height as i32)
+        .min(display.origin_y.saturating_add(display.physical_height as i32));
+    let overlap_w = i64::from(right.saturating_sub(left)).max(0);
+    let overlap_h = i64::from(bottom.saturating_sub(top)).max(0);
+    overlap_w.saturating_mul(overlap_h)
 }
 
 fn logical_client_point(x: f64, y: f64, scale: f64) -> Option<(i32, i32)> {

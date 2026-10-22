@@ -157,6 +157,63 @@ pub fn logical_to_physical_px(logical: i32, scale: f64) -> Option<i32> {
     Some(round_half_away_from_zero(logical as f64 * scale))
 }
 
+pub fn logical_client_keeping_physical(
+    physical_w: u32,
+    physical_h: u32,
+    scale: f64,
+) -> Option<(u32, u32)> {
+    if physical_w == 0 || physical_h == 0 {
+        return None;
+    }
+    Some((logical_side(physical_w, scale)?, logical_side(physical_h, scale)?))
+}
+
+pub fn one_to_one_physical_size(
+    frame_w: u32,
+    frame_h: u32,
+    scale: f64,
+    strip_visible: bool,
+) -> Option<(u32, u32)> {
+    if frame_w == 0 || frame_h == 0 {
+        return None;
+    }
+    let strip = if strip_visible {
+        u32::try_from(logical_to_physical_px(48, scale)?).ok()?
+    } else if !scale.is_finite() || scale <= 0.0 {
+        return None;
+    } else {
+        0
+    };
+    Some((frame_w, frame_h.saturating_add(strip)))
+}
+
+pub fn shift_into_work_area(
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    work: WorkArea,
+) -> (i32, i32) {
+    (
+        shift_axis(x, width, work.x, work.width),
+        shift_axis(y, height, work.y, work.height),
+    )
+}
+
+fn shift_axis(origin: i32, size: u32, work_origin: i32, work_size: u32) -> i32 {
+    let original = origin;
+    let origin = i64::from(origin);
+    let size = i64::from(size);
+    let work_origin = i64::from(work_origin);
+    let work_size = i64::from(work_size);
+    let shifted = if size >= work_size {
+        work_origin
+    } else {
+        origin.clamp(work_origin, work_origin + work_size - size)
+    };
+    i32::try_from(shifted).unwrap_or(original)
+}
+
 fn round_half_away_from_zero(value: f64) -> i32 {
     let magnitude = value.abs();
     let fraction = magnitude - magnitude.floor();
