@@ -18,11 +18,11 @@ Windows, and stable Rust with the MSVC toolchain. This repository does not pin a
 cargo build --release
 ```
 
-The build writes `target/release/screenpatch.exe`. That path is not stored in git. The binary for this version is [release/screenpatch.exe](release/screenpatch.exe).
+The build writes `target/release/ScreenPatch.exe`. That path is not stored in git. The binary for this version is [release/ScreenPatch.exe](release/ScreenPatch.exe).
 
 ## Run
 
-Start `release/screenpatch.exe`, or run `cargo run`. A tray icon appears and no window opens. Starting the program again exits immediately and does not add a second icon.
+Start `release/ScreenPatch.exe`, or run `cargo run`. A tray icon appears and no window opens. Starting the program again exits immediately and does not add a second icon.
 
 ## Language
 

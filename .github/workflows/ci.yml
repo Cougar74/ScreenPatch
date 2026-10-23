@@ -27,5 +27,5 @@ jobs:
       - run: cargo build --release
       - uses: softprops/action-gh-release@v2
         with:
-          files: target/release/screenpatch.exe
+          files: target/release/ScreenPatch.exe
           fail_on_unmatched_files: true

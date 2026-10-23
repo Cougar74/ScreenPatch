@@ -1,5 +1,12 @@
 ﻿# Changelog
 
+## 0.1.1
+
+The Windows binary is `release/ScreenPatch.exe`.
+
+- Explorer shows the application icon, and the file properties name the program ScreenPatch.
+- The release build does not open a console window.
+
 ## 0.1.0
 
 First release. The Windows binary is `release/screenpatch.exe`.

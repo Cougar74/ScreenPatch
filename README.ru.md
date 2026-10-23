@@ -18,11 +18,11 @@ Windows и стабильный Rust с MSVC. Номер компилятора 
 cargo build --release
 ```
 
-Сборка записывает `target/release/screenpatch.exe`. Этот путь в git не входит. Готовый файл этой версии — [release/screenpatch.exe](release/screenpatch.exe).
+Сборка записывает `target/release/ScreenPatch.exe`. Этот путь в git не входит. Готовый файл этой версии — [release/ScreenPatch.exe](release/ScreenPatch.exe).
 
 ## Запуск
 
-Запустите `release/screenpatch.exe` или `cargo run`. Появляется значок в трее, окон нет. Повторный запуск сразу завершается и второй значок не создаёт.
+Запустите `release/ScreenPatch.exe` или `cargo run`. Появляется значок в трее, окон нет. Повторный запуск сразу завершается и второй значок не создаёт.
 
 ## Язык
 
