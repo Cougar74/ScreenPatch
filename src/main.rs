@@ -20,7 +20,7 @@ use windows::Win32::UI::HiDpi::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSMICON};
 
-use screenpatch::core::commands::{client_hit, PanelAction};
+use screenpatch::core::commands::{client_hit, strip_press_target, PanelAction};
 use screenpatch::core::language::{self, Language};
 use screenpatch::core::geometry::{
     logical_client_keeping_physical, logical_to_physical_px, logical_window_size,
@@ -88,6 +88,7 @@ struct PatchWindow {
     affinity: bool,
     refreshing: bool,
     strip_visible: bool,
+    strip_press: Option<PanelAction>,
     physical_client: (u32, u32),
 }
 
@@ -292,6 +293,15 @@ impl ApplicationHandler for App {
                 self.windows[index].cursor = logical_client_point(position.x, position.y, scale);
                 self.update_patch_cursor(index);
                 self.apply_corner_resize(index);
+                if self.windows[index].strip_press.is_some() {
+                    self.windows[index].window.request_redraw();
+                }
+            }
+            WindowEvent::CursorLeft { .. } => {
+                self.windows[index].cursor = None;
+                if self.windows[index].strip_press.is_some() {
+                    self.windows[index].window.request_redraw();
+                }
             }
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
@@ -307,7 +317,11 @@ impl ApplicationHandler for App {
                 state: ElementState::Released,
                 button: MouseButton::Left,
                 ..
-            } => self.end_corner_resize(index),
+            } => {
+                if !self.finish_strip_press(index) {
+                    self.end_corner_resize(index);
+                }
+            }
             WindowEvent::Resized(_) => {
                 self.remember_physical_client(index);
                 self.windows[index].window.request_redraw();
@@ -646,6 +660,7 @@ impl App {
             affinity,
             refreshing: false,
             strip_visible: false,
+            strip_press: None,
             physical_client: (physical_w, physical_h),
         });
         Ok(())
@@ -848,6 +863,7 @@ impl App {
                     self.say(language::STRIP_SAVE),
                     self.say(language::STRIP_CLOSE),
                 ],
+                self.strip_press_visual(index),
             )
         };
         let frame = compose_patch(&shown, size.width, size.height, strip, &labels);
@@ -908,6 +924,7 @@ impl App {
     }
 
     fn toggle_strip(&mut self, index: usize) {
+        self.windows[index].strip_press = None;
         let number = self.windows[index].number;
         let scale = self.windows[index].window.scale_factor();
         let Some(strip) = logical_to_physical_px(48, scale).filter(|strip| *strip > 0) else {
@@ -1044,16 +1061,52 @@ impl App {
             PanelAction::Drag => {
                 let _ = window.drag_window();
             }
-            PanelAction::Refresh => self.refresh(index),
-            PanelAction::BeforeAfter => {
-                let number = self.windows[index].number;
-                let _ = self.patches.toggle_shown(number);
+            action @ (PanelAction::Refresh
+            | PanelAction::BeforeAfter
+            | PanelAction::Copy
+            | PanelAction::Save
+            |             PanelAction::Close) => {
+                self.windows[index].strip_press = Some(action);
                 window.request_redraw();
             }
-            PanelAction::Copy => self.copy_shown(index),
-            PanelAction::Save => self.save_shown(index),
-            PanelAction::Close => self.close_patch(index),
         }
+    }
+
+    fn strip_press_visual(&self, index: usize) -> Option<PanelAction> {
+        let (x, y) = self.windows[index].cursor?;
+        let (width, height) = logical_client_size(&self.windows[index].window);
+        let hit = client_hit(x, y, width, height, self.windows[index].strip_visible);
+        strip_press_target(self.windows[index].strip_press, hit)
+    }
+
+    fn finish_strip_press(&mut self, index: usize) -> bool {
+        let remembered = self.windows[index].strip_press.take();
+        let hit = if let Some((x, y)) = self.windows[index].cursor {
+            let (width, height) = logical_client_size(&self.windows[index].window);
+            client_hit(x, y, width, height, self.windows[index].strip_visible)
+        } else {
+            PanelAction::Drag
+        };
+        let action = strip_press_target(remembered, hit);
+        if action != Some(PanelAction::Close) && remembered.is_some() {
+            self.windows[index].window.request_redraw();
+        }
+        match action {
+            Some(PanelAction::Refresh) => self.refresh(index),
+            Some(PanelAction::BeforeAfter) => {
+                let number = self.windows[index].number;
+                let _ = self.patches.toggle_shown(number);
+                self.windows[index].window.request_redraw();
+            }
+            Some(PanelAction::Copy) => self.copy_shown(index),
+            Some(PanelAction::Save) => self.save_shown(index),
+            Some(PanelAction::Close) => {
+                self.close_patch(index);
+                return true;
+            }
+            _ => {}
+        }
+        false
     }
 
     fn update_patch_cursor(&self, index: usize) {

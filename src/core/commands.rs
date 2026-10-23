@@ -60,3 +60,16 @@ pub fn panel_hit(x: i32, y: i32, width: u32, height: u32) -> PanelAction {
         _ => PanelAction::Close,
     }
 }
+
+pub fn strip_press_target(remembered: Option<PanelAction>, hit: PanelAction) -> Option<PanelAction> {
+    match remembered {
+        Some(
+            action @ (PanelAction::Refresh
+            | PanelAction::BeforeAfter
+            | PanelAction::Copy
+            | PanelAction::Save
+            | PanelAction::Close),
+        ) if hit == action => Some(action),
+        _ => None,
+    }
+}

@@ -29,6 +29,7 @@ use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use xcap::Monitor;
 
 use crate::capture::service::{frame_from_rgba, CaptureError};
+use crate::core::commands::PanelAction;
 use crate::core::geometry::{physical_to_logical_px, CaptureRect, WorkArea};
 use crate::core::language::{self, Language};
 use crate::core::refresh::{ImageFrame, Fingerprint};
@@ -451,6 +452,7 @@ pub fn draw_strip(
     height: u32,
     before_after_enabled: bool,
     labels: [&str; 5],
+    pressed: Option<PanelAction>,
 ) -> Vec<u8> {
     let pixels = (width as usize).saturating_mul(height as usize).saturating_mul(4);
     let mut rgba = vec![32u8, 32, 32, 255].repeat(pixels / 4);
@@ -486,11 +488,20 @@ pub fn draw_strip(
         for pixel in source.chunks_exact_mut(4) {
             pixel.copy_from_slice(&[32, 32, 32, 255]);
         }
+        let row = height / 3;
+        let mid = width / 2;
+        if let Some((left, top, right, bottom)) = pressed_cell_rect(pressed, width, height, mid, row)
+        {
+            for y in top..bottom {
+                for x in left..right {
+                    let index = ((y * width + x) * 4) as usize;
+                    source[index..index + 4].copy_from_slice(&[14, 14, 14, 255]);
+                }
+            }
+        }
         let font = GetStockObject(windows::Win32::Graphics::Gdi::DEFAULT_GUI_FONT);
         let previous_font = SelectObject(dc, font);
         let _ = SetBkMode(dc, TRANSPARENT);
-        let row = height / 3;
-        let mid = width / 2;
         let cells = [
             (0, 0, mid, row, labels[0], true),
             (mid, 0, width, row, labels[1], before_after_enabled),
@@ -528,6 +539,23 @@ pub fn draw_strip(
     }
     stroke_strip(&mut rgba, width, height);
     rgba
+}
+
+fn pressed_cell_rect(
+    pressed: Option<PanelAction>,
+    width: u32,
+    height: u32,
+    mid: u32,
+    row: u32,
+) -> Option<(u32, u32, u32, u32)> {
+    match pressed {
+        Some(PanelAction::Refresh) => Some((0, 0, mid, row)),
+        Some(PanelAction::BeforeAfter) => Some((mid, 0, width, row)),
+        Some(PanelAction::Copy) => Some((0, row, mid, row.saturating_mul(2))),
+        Some(PanelAction::Save) => Some((mid, row, width, row.saturating_mul(2))),
+        Some(PanelAction::Close) => Some((0, row.saturating_mul(2), width, height)),
+        _ => None,
+    }
 }
 
 fn stroke_strip(pixels: &mut [u8], width: u32, height: u32) {

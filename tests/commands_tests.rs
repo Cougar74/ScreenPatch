@@ -1,7 +1,8 @@
-use screenpatch::core::commands::{panel_hit, PanelAction};
+use screenpatch::core::commands::{panel_hit, strip_press_target, PanelAction};
 use screenpatch::core::geometry::CaptureRect;
 use screenpatch::core::patches::PatchManager;
 use screenpatch::core::refresh::image_frame;
+use screenpatch::platform::draw_strip;
 
 fn frame(width: u32, height: u32, fill: u8) -> screenpatch::core::refresh::ImageFrame {
     let len = (width * height * 4) as usize;
@@ -97,4 +98,52 @@ fn hiding_windows_keeps_bytes_and_close_all_needs_confirmation() {
     assert!(manager.close_all(true));
     assert_eq!(manager.len(), 0);
     assert_eq!(manager.used_bytes(), 0);
+}
+
+#[test]
+fn strip_press_stays_on_the_same_button() {
+    assert_eq!(
+        strip_press_target(Some(PanelAction::Refresh), PanelAction::Refresh),
+        Some(PanelAction::Refresh)
+    );
+    assert_eq!(
+        strip_press_target(Some(PanelAction::Refresh), PanelAction::Copy),
+        None
+    );
+    assert_eq!(
+        strip_press_target(Some(PanelAction::Refresh), PanelAction::Refresh),
+        Some(PanelAction::Refresh)
+    );
+    assert_eq!(
+        strip_press_target(Some(PanelAction::Refresh), PanelAction::Drag),
+        None
+    );
+    assert_eq!(strip_press_target(Some(PanelAction::Drag), PanelAction::Refresh), None);
+    assert_eq!(
+        strip_press_target(Some(PanelAction::Resize), PanelAction::Resize),
+        None
+    );
+    assert_eq!(
+        strip_press_target(Some(PanelAction::BeforeAfter), PanelAction::BeforeAfter),
+        Some(PanelAction::BeforeAfter)
+    );
+    assert_eq!(strip_press_target(None, PanelAction::Refresh), None);
+}
+
+fn strip_pixel(strip: &[u8], width: u32, x: u32, y: u32) -> [u8; 3] {
+    let index = ((y * width + x) * 4) as usize;
+    [strip[index], strip[index + 1], strip[index + 2]]
+}
+
+#[test]
+fn pressed_strip_cell_is_darker_than_its_neighbor() {
+    let labels = ["a", "b", "c", "d", "e"];
+    let plain = draw_strip(120, 48, true, labels, None);
+    let pressed = draw_strip(120, 48, false, labels, Some(PanelAction::Refresh));
+    assert_eq!(strip_pixel(&plain, 120, 2, 2), [32, 32, 32]);
+    assert_eq!(strip_pixel(&pressed, 120, 2, 2), [14, 14, 14]);
+    assert_eq!(strip_pixel(&pressed, 120, 62, 2), [32, 32, 32]);
+    let close = draw_strip(120, 48, true, labels, Some(PanelAction::Close));
+    assert_eq!(strip_pixel(&close, 120, 100, 40), [14, 14, 14]);
+    assert_eq!(strip_pixel(&close, 120, 2, 2), [32, 32, 32]);
 }
