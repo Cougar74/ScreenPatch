@@ -47,6 +47,10 @@ pub const STRIP_BEFORE_AFTER: Phrase = Phrase { ru: "До/после", en: "Befo
 pub const STRIP_COPY: Phrase = Phrase { ru: "Копировать", en: "Copy" };
 pub const STRIP_SAVE: Phrase = Phrase { ru: "Сохранить", en: "Save" };
 pub const STRIP_CLOSE: Phrase = Phrase { ru: "Закрыть", en: "Close" };
+pub const BUTTON_ICON_FAILED: Phrase = Phrase {
+    ru: "не удалось прочитать иконку кнопки: {err}",
+    en: "could not read the button icon: {err}",
+};
 pub const CLOSE_ALL_QUESTION: Phrase = Phrase {
     ru: "Закрыть все снимки и освободить их кадры?",
     en: "Close all captures and release their frames?",

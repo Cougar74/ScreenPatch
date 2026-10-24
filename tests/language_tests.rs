@@ -1,5 +1,6 @@
 use screenpatch::core::language::{
-    parse_saved_language, text, Language, MONITOR_MISSING, TRAY_NEW, TRAY_OTHER_LANGUAGE,
+    parse_saved_language, text, Language, BUTTON_ICON_FAILED, MONITOR_MISSING, TRAY_NEW,
+    TRAY_OTHER_LANGUAGE,
 };
 
 #[test]
@@ -34,4 +35,16 @@ fn russian_monitor_missing_keeps_the_checklist_words() {
     let english = text(Language::En, MONITOR_MISSING);
     assert!(english.contains("no longer connected"));
     assert!(english.chars().all(|ch| !('\u{0400}'..='\u{04FF}').contains(&ch)));
+}
+
+#[test]
+fn button_icon_failure_names_the_read_error() {
+    assert_eq!(
+        text(Language::Ru, BUTTON_ICON_FAILED),
+        "не удалось прочитать иконку кнопки: {err}"
+    );
+    assert_eq!(
+        text(Language::En, BUTTON_ICON_FAILED),
+        "could not read the button icon: {err}"
+    );
 }

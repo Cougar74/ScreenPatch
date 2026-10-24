@@ -20,7 +20,9 @@ use windows::Win32::UI::HiDpi::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSMICON};
 
-use screenpatch::core::commands::{client_hit, strip_press_target, PanelAction};
+use screenpatch::core::commands::{
+    client_hit, decode_button_icon, draw_buttons, strip_press_target, ButtonIcon, PanelAction,
+};
 use screenpatch::core::language::{self, Language};
 use screenpatch::core::geometry::{
     logical_client_keeping_physical, logical_to_physical_px, logical_window_size,
@@ -37,7 +39,7 @@ use screenpatch::core::selection::{
 };
 use screenpatch::platform::{
     acquire_single_instance, capture_monitor_region, choose_png_path, confirm_close_all,
-    draw_strip, hwnd_from_window, list_displays, read_saved_language, suggested_png_name,
+    hwnd_from_window, list_displays, read_saved_language, suggested_png_name,
     system_ui_language, try_exclude_from_capture, wait_until_hidden, write_saved_language,
     DisplayInfo, Hwnd,
 };
@@ -132,6 +134,7 @@ fn run() -> Result<(), String> {
         eprintln!("{}", language::text(language, language::ALREADY_RUNNING));
         return Ok(());
     }
+    let _ = button_icons(language);
     enable_per_monitor_dpi();
     let event_loop = EventLoop::new().map_err(|err| {
         language::render(language, language::EVENT_LOOP_CREATE_FAILED, &[("err", &err.to_string())])
@@ -596,7 +599,7 @@ impl App {
             logical_window_size(frame.width, frame.height, display.scale)
                 .ok_or_else(|| self.fill(language::BAD_MONITOR_SCALE, &[("id", &display.id)]))?;
         let (physical_w, physical_h) =
-            one_to_one_physical_size(frame.width, frame.height, display.scale, false)
+            one_to_one_physical_size(frame.width, frame.height, display.scale)
                 .ok_or_else(|| self.fill(language::BAD_MONITOR_SCALE, &[("id", &display.id)]))?;
         let (logical_w, logical_h) =
             logical_client_keeping_physical(physical_w, physical_h, display.scale)
@@ -838,35 +841,20 @@ impl App {
             .shown_frame(number)
             .cloned()
             .unwrap_or_else(|| self.windows[index].frame.clone());
-        let before_enabled = self
-            .patches
-            .get(number)
-            .is_some_and(|patch| patch.previous.is_some());
         let scale = window.scale_factor();
-        let strip = if self.windows[index].strip_visible {
-            logical_to_physical_px(48, scale).unwrap_or(0).max(0) as u32
-        } else {
-            0
-        };
-        let strip = strip.min(size.height);
-        let labels = if strip == 0 {
-            Vec::new()
-        } else {
-            draw_strip(
-                size.width,
-                strip,
-                before_enabled,
-                [
-                    self.say(language::STRIP_REFRESH),
-                    self.say(language::STRIP_BEFORE_AFTER),
-                    self.say(language::STRIP_COPY),
-                    self.say(language::STRIP_SAVE),
-                    self.say(language::STRIP_CLOSE),
-                ],
+        let mut frame = compose_patch(&shown, size.width, size.height);
+        if self.windows[index].strip_visible {
+            let mut pixels = frame.pixels.to_vec();
+            draw_buttons(
+                &mut pixels,
+                frame.width,
+                frame.height,
+                scale,
                 self.strip_press_visual(index),
-            )
-        };
-        let frame = compose_patch(&shown, size.width, size.height, strip, &labels);
+                button_icons(self.language),
+            );
+            frame.pixels = Arc::from(pixels.into_boxed_slice());
+        }
         present_frame(&window, &mut self.windows[index].surface, &frame);
         self.remember_physical_client(index);
     }
@@ -887,7 +875,7 @@ impl App {
             .unwrap_or_else(|| self.windows[index].frame.clone());
         let scale = self.windows[index].window.scale_factor();
         let Some((width, height)) =
-            one_to_one_physical_size(frame.width, frame.height, scale, self.windows[index].strip_visible)
+            one_to_one_physical_size(frame.width, frame.height, scale)
         else {
             eprintln!("{}", self.fill(language::BAD_WINDOW_SCALE, &[("number", &number.to_string())]));
             return;
@@ -925,24 +913,8 @@ impl App {
 
     fn toggle_strip(&mut self, index: usize) {
         self.windows[index].strip_press = None;
-        let number = self.windows[index].number;
-        let scale = self.windows[index].window.scale_factor();
-        let Some(strip) = logical_to_physical_px(48, scale).filter(|strip| *strip > 0) else {
-            eprintln!("{}", self.fill(language::BAD_WINDOW_SCALE, &[("number", &number.to_string())]));
-            return;
-        };
-        let strip = strip as u32;
-        let (width, height) = self.windows[index].physical_client;
-        let height = if self.windows[index].strip_visible {
-            height.saturating_sub(strip).max(1)
-        } else {
-            height.saturating_add(strip)
-        };
         self.windows[index].strip_visible = !self.windows[index].strip_visible;
-        let window = Arc::clone(&self.windows[index].window);
-        let _ = window.request_inner_size(PhysicalSize::new(width, height));
-        self.windows[index].physical_client = (width, height);
-        window.request_redraw();
+        self.windows[index].window.request_redraw();
     }
 
     fn dismiss_overlays(&mut self, _event_loop: &ActiveEventLoop) {
@@ -1451,18 +1423,11 @@ fn register_hotkey() -> Result<(GlobalHotKeyManager, u32), String> {
     Ok((manager, id))
 }
 
-fn compose_patch(
-    frame: &ImageFrame,
-    width: u32,
-    height: u32,
-    strip: u32,
-    labels: &[u8],
-) -> ImageFrame {
+fn compose_patch(frame: &ImageFrame, width: u32, height: u32) -> ImageFrame {
     let width = width.max(1);
     let height = height.max(1);
     let mut pixels = vec![24u8, 24, 24, 255].repeat(width as usize * height as usize);
-    let image_height = height.saturating_sub(strip);
-    if let Some(placed) = letterbox(width, image_height, frame.width, frame.height) {
+    if let Some(placed) = letterbox(width, height, frame.width, frame.height) {
         for local_y in 0..placed.height {
             let source_y =
                 ((u64::from(local_y) * u64::from(frame.height)) / u64::from(placed.height)) as u32;
@@ -1470,25 +1435,45 @@ fn compose_patch(
                 let source_x =
                     ((u64::from(local_x) * u64::from(frame.width)) / u64::from(placed.width)) as u32;
                 let source = ((source_y * frame.width + source_x) * 4) as usize;
-                let destination_y = strip + placed.y + local_y;
-                let destination =
-                    ((destination_y * width + placed.x + local_x) * 4) as usize;
+                let destination_y = placed.y + local_y;
+                let destination = ((destination_y * width + placed.x + local_x) * 4) as usize;
                 pixels[destination..destination + 4]
                     .copy_from_slice(&frame.pixels[source..source + 4]);
             }
         }
     }
-    let strip_bytes = (width as usize)
-        .saturating_mul(strip.min(height) as usize)
-        .saturating_mul(4)
-        .min(labels.len())
-        .min(pixels.len());
-    pixels[..strip_bytes].copy_from_slice(&labels[..strip_bytes]);
     ImageFrame {
         pixels: Arc::from(pixels.into_boxed_slice()),
         width,
         height,
     }
+}
+
+fn button_icons(language: Language) -> &'static [Option<ButtonIcon>; 5] {
+    static ICONS: OnceLock<[Option<ButtonIcon>; 5]> = OnceLock::new();
+    ICONS.get_or_init(|| {
+        const BUTTON_ICON_BYTES: [&[u8]; 5] = [
+            include_bytes!("icons/refresh.png"),
+            include_bytes!("icons/before-after.png"),
+            include_bytes!("icons/copy.png"),
+            include_bytes!("icons/save.png"),
+            include_bytes!("icons/close.png"),
+        ];
+        std::array::from_fn(|index| match decode_button_icon(BUTTON_ICON_BYTES[index]) {
+            Some(icon) => Some(icon),
+            None => {
+                eprintln!(
+                    "{}",
+                    language::render(
+                        language,
+                        language::BUTTON_ICON_FAILED,
+                        &[("err", "invalid image")],
+                    )
+                );
+                None
+            }
+        })
+    })
 }
 
 fn present_frame(

@@ -168,23 +168,11 @@ pub fn logical_client_keeping_physical(
     Some((logical_side(physical_w, scale)?, logical_side(physical_h, scale)?))
 }
 
-pub fn one_to_one_physical_size(
-    frame_w: u32,
-    frame_h: u32,
-    scale: f64,
-    strip_visible: bool,
-) -> Option<(u32, u32)> {
-    if frame_w == 0 || frame_h == 0 {
+pub fn one_to_one_physical_size(frame_w: u32, frame_h: u32, scale: f64) -> Option<(u32, u32)> {
+    if frame_w == 0 || frame_h == 0 || !scale.is_finite() || scale <= 0.0 {
         return None;
     }
-    let strip = if strip_visible {
-        u32::try_from(logical_to_physical_px(48, scale)?).ok()?
-    } else if !scale.is_finite() || scale <= 0.0 {
-        return None;
-    } else {
-        0
-    };
-    Some((frame_w, frame_h.saturating_add(strip)))
+    Some((frame_w, frame_h))
 }
 
 pub fn shift_into_work_area(

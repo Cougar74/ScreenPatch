@@ -25,12 +25,13 @@ fn logical_size_rejects_a_bad_scale_and_a_zero_side() {
 }
 
 #[test]
-fn one_to_one_adds_the_strip_only_when_it_is_visible() {
-    assert_eq!(one_to_one_physical_size(640, 400, 1.0, true), Some((640, 448)));
-    assert_eq!(one_to_one_physical_size(640, 400, 1.0, false), Some((640, 400)));
-    assert_eq!(one_to_one_physical_size(640, 400, 1.25, true), Some((640, 460)));
-    assert_eq!(one_to_one_physical_size(10, 10, 1.0, true), Some((10, 58)));
-    assert_eq!(one_to_one_physical_size(640, 400, 0.0, true), None);
+fn one_to_one_is_the_frame_size_for_any_button_visibility() {
+    assert_eq!(one_to_one_physical_size(640, 400, 1.0), Some((640, 400)));
+    assert_eq!(one_to_one_physical_size(640, 400, 1.25), Some((640, 400)));
+    assert_eq!(one_to_one_physical_size(10, 10, 1.0), Some((10, 10)));
+    assert_eq!(one_to_one_physical_size(640, 400, 0.0), None);
+    assert_eq!(one_to_one_physical_size(640, 400, f64::NAN), None);
+    assert_eq!(one_to_one_physical_size(0, 400, 1.0), None);
 }
 
 #[test]
