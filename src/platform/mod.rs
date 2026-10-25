@@ -4,7 +4,7 @@ pub mod windows;
 #[cfg(windows)]
 pub use windows::{
     acquire_single_instance, capture_monitor_region, choose_png_path, confirm_close_all,
-    hwnd_from_window, list_displays, read_saved_language, suggested_png_name,
-    system_ui_language, try_exclude_from_capture, wait_until_hidden, write_saved_language,
-    DisplayInfo, Hwnd,
+    cursor_screen_point, hwnd_from_window, list_displays, paint_help, read_saved_language,
+    suggested_png_name, system_ui_language, try_exclude_from_capture, wait_until_hidden,
+    write_saved_language, DisplayInfo, Hwnd,
 };

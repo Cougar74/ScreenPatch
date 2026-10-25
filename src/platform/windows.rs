@@ -5,10 +5,16 @@ use std::time::{Duration, Instant};
 
 use windows::core::{w, BOOL, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
-    CloseHandle, GetLastError, SetLastError, ERROR_ALREADY_EXISTS, HWND, LPARAM, RECT, WIN32_ERROR,
+    CloseHandle, GetLastError, SetLastError, COLORREF, ERROR_ALREADY_EXISTS, HWND, LPARAM, POINT,
+    RECT, SIZE, WIN32_ERROR,
 };
 use windows::Win32::Graphics::Gdi::{
-    EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO,
+    CreateCompatibleDC, CreateDIBSection, CreateFontW, DeleteDC, DeleteObject, DrawTextW,
+    EnumDisplayMonitors, GetMonitorInfoW, GetTextExtentPoint32W, SelectObject, SetBkMode,
+    SetTextColor, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS,
+    DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_TOP,
+    FF_DONTCARE, FW_BOLD, FW_NORMAL, OUT_DEFAULT_PRECIS, HDC, HFONT, HGDIOBJ, HMONITOR, MONITORINFO,
+    TRANSPARENT,
 };
 use windows::Win32::Globalization::GetUserDefaultUILanguage;
 use windows::Win32::System::SystemInformation::GetLocalTime;
@@ -17,16 +23,19 @@ use windows::Win32::UI::Controls::Dialogs::{
     CommDlgExtendedError, GetSaveFileNameW, OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST, OPENFILENAMEW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, IsWindowVisible, MessageBoxW, MsgWaitForMultipleObjects, PeekMessageW,
-    SetWindowDisplayAffinity, TranslateMessage, IDYES, MB_ICONQUESTION, MB_YESNO, MSG, PM_REMOVE,
-    QS_ALLINPUT, WDA_EXCLUDEFROMCAPTURE,
+    DispatchMessageW, GetCursorPos, IsWindowVisible, MessageBoxW, MsgWaitForMultipleObjects,
+    PeekMessageW, SetWindowDisplayAffinity, TranslateMessage, IDYES, MB_ICONQUESTION, MB_YESNO,
+    MSG, PM_REMOVE, QS_ALLINPUT, WDA_EXCLUDEFROMCAPTURE,
 };
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use xcap::Monitor;
 
 use crate::capture::service::{frame_from_rgba, CaptureError};
-use crate::core::geometry::{physical_to_logical_px, CaptureRect, WorkArea};
-use crate::core::language::{self, Language};
+use crate::core::geometry::{
+    help_line_top, logical_to_physical_px, physical_to_logical_px, CaptureRect, WorkArea,
+    HELP_LINE_HEIGHT, HELP_PAD_X,
+};
+use crate::core::language::{self, help_key, Language};
 use crate::core::refresh::{ImageFrame, Fingerprint};
 
 #[derive(Clone, Debug)]
@@ -440,6 +449,141 @@ pub fn choose_png_path(
     }
     let end = file.iter().position(|unit| *unit == 0).unwrap_or(file.len());
     Ok(Some(PathBuf::from(String::from_utf16_lossy(&file[..end]))))
+}
+
+pub fn cursor_screen_point() -> Option<(i32, i32)> {
+    let mut point = POINT::default();
+    unsafe { GetCursorPos(&mut point).ok()? };
+    Some((point.x, point.y))
+}
+
+pub fn paint_help(width: u32, height: u32, scale: f64, lines: &[&str; 12]) -> Vec<u8> {
+    let pixels = (width as usize).saturating_mul(height as usize).saturating_mul(4);
+    let mut rgba = vec![32u8, 32, 32, 255].repeat(pixels / 4);
+    if width == 0 || height == 0 {
+        return rgba;
+    }
+    unsafe { draw_help_lines(&mut rgba, width, height, scale, lines) };
+    rgba
+}
+
+unsafe fn draw_help_lines(rgba: &mut [u8], width: u32, height: u32, scale: f64, lines: &[&str; 12]) {
+    let dc = CreateCompatibleDC(None);
+    if dc.is_invalid() {
+        return;
+    }
+    let info = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: width as i32,
+            biHeight: -(height as i32),
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut bits: *mut c_void = std::ptr::null_mut();
+    let bitmap = CreateDIBSection(Some(dc), &info, DIB_RGB_COLORS, &mut bits, None, 0);
+    if bitmap.is_err() || bits.is_null() {
+        let _ = DeleteDC(dc);
+        return;
+    }
+    let bitmap = bitmap.unwrap_or_default();
+    let bitmap_object = HGDIOBJ::from(bitmap);
+    let previous = SelectObject(dc, bitmap_object);
+    let count = (width as usize).saturating_mul(height as usize).saturating_mul(4);
+    let source = std::slice::from_raw_parts_mut(bits as *mut u8, count.min(rgba.len()));
+    for pixel in source.chunks_exact_mut(4) {
+        pixel.copy_from_slice(&[32, 32, 32, 255]);
+    }
+    let font_height = -logical_to_physical_px(16, scale).unwrap_or(16);
+    let font = help_font(font_height, FW_NORMAL.0 as i32);
+    let bold = help_font(font_height, FW_BOLD.0 as i32);
+    let bold_ready = !bold.is_invalid();
+    if !font.is_invalid() {
+        let font_object = HGDIOBJ::from(font);
+        let bold_object = HGDIOBJ::from(bold);
+        let previous_font = SelectObject(dc, font_object);
+        let _ = SetBkMode(dc, TRANSPARENT);
+        let _ = SetTextColor(dc, COLORREF(0x00FF_FFFF));
+        let left = logical_to_physical_px(HELP_PAD_X, scale).unwrap_or(HELP_PAD_X);
+        let line_height =
+            logical_to_physical_px(HELP_LINE_HEIGHT, scale).unwrap_or(HELP_LINE_HEIGHT);
+        let right = width as i32 - left;
+        for (index, line) in lines.iter().enumerate() {
+            let top = logical_to_physical_px(help_line_top(index), scale)
+                .unwrap_or(help_line_top(index));
+            let mut bounds = RECT {
+                left,
+                top,
+                right,
+                bottom: top.saturating_add(line_height),
+            };
+            if let Some(key) = help_key(line) {
+                if bold_ready {
+                    let _ = SelectObject(dc, bold_object);
+                    draw_help_text(dc, key, &mut bounds);
+                    let measured: Vec<u16> = key.encode_utf16().collect();
+                    let mut extent = SIZE { cx: 0, cy: 0 };
+                    if GetTextExtentPoint32W(dc, &measured, &mut extent).as_bool() {
+                        bounds.left = left.saturating_add(extent.cx);
+                    }
+                    let _ = SelectObject(dc, font_object);
+                    draw_help_text(dc, &line[key.len()..], &mut bounds);
+                    continue;
+                }
+            }
+            let _ = SelectObject(dc, font_object);
+            draw_help_text(dc, line, &mut bounds);
+        }
+        let _ = SelectObject(dc, previous_font);
+        let _ = DeleteObject(font_object);
+        if bold_ready {
+            let _ = DeleteObject(bold_object);
+        }
+    } else if bold_ready {
+        let _ = DeleteObject(HGDIOBJ::from(bold));
+    }
+    for (rgba_pixel, bgra) in rgba.chunks_exact_mut(4).zip(source.chunks_exact(4)) {
+        rgba_pixel[0] = bgra[2];
+        rgba_pixel[1] = bgra[1];
+        rgba_pixel[2] = bgra[0];
+        rgba_pixel[3] = 255;
+    }
+    let _ = SelectObject(dc, previous);
+    let _ = DeleteObject(bitmap_object);
+    let _ = DeleteDC(dc);
+}
+
+unsafe fn help_font(height: i32, weight: i32) -> HFONT {
+    CreateFontW(
+        height,
+        0,
+        0,
+        0,
+        weight,
+        0,
+        0,
+        0,
+        DEFAULT_CHARSET,
+        OUT_DEFAULT_PRECIS,
+        CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_QUALITY,
+        u32::from(DEFAULT_PITCH.0) | u32::from(FF_DONTCARE.0),
+        w!("Segoe UI"),
+    )
+}
+
+unsafe fn draw_help_text(dc: HDC, text: &str, bounds: &mut RECT) {
+    let mut wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    let _ = DrawTextW(
+        dc,
+        &mut wide,
+        bounds,
+        DT_LEFT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX,
+    );
 }
 
 unsafe extern "system" fn enum_monitors(

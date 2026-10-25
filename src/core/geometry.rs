@@ -119,6 +119,34 @@ pub fn place_window(
     farthest_corner(capture, window_width, window_height, work)
 }
 
+pub const HELP_CLIENT_WIDTH: u32 = 420;
+pub const HELP_CLIENT_HEIGHT: u32 = 376;
+pub const HELP_PAD_X: i32 = 24;
+pub const HELP_PAD_Y: i32 = 20;
+pub const HELP_LINE_HEIGHT: i32 = 28;
+
+pub fn help_line_top(index: usize) -> i32 {
+    HELP_PAD_Y + i32::try_from(index).unwrap_or(i32::MAX).saturating_mul(HELP_LINE_HEIGHT)
+}
+
+pub fn help_window_origin(work: WorkArea) -> (i32, i32) {
+    let x = work.x + (i32::try_from(work.width).unwrap_or(i32::MAX) - HELP_CLIENT_WIDTH as i32) / 2;
+    let y =
+        work.y + (i32::try_from(work.height).unwrap_or(i32::MAX) - HELP_CLIENT_HEIGHT as i32) / 2;
+    (x, y)
+}
+
+pub fn index_containing_point(x: i32, y: i32, rects: &[(i32, i32, u32, u32)]) -> Option<usize> {
+    rects.iter().position(|(left, top, width, height)| {
+        let right = i64::from(*left) + i64::from(*width);
+        let bottom = i64::from(*top) + i64::from(*height);
+        i64::from(x) >= i64::from(*left)
+            && i64::from(y) >= i64::from(*top)
+            && i64::from(x) < right
+            && i64::from(y) < bottom
+    })
+}
+
 pub fn select_monitor_pair(monitors: &[MonitorCandidate]) -> Option<(usize, usize)> {
     let fitting: Vec<usize> = monitors
         .iter()

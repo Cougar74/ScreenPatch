@@ -7,7 +7,7 @@ use global_hotkey::{
     hotkey::{Code, HotKey, Modifiers},
     GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState,
 };
-use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem};
+use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
@@ -23,11 +23,13 @@ use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSMICON};
 use screenpatch::core::commands::{
     client_hit, decode_button_icon, draw_buttons, strip_press_target, ButtonIcon, PanelAction,
 };
-use screenpatch::core::language::{self, Language};
+use screenpatch::core::language::{
+    self, help_lines, language_choice, Language, LANGUAGE_NAME_EN, LANGUAGE_NAME_RU,
+};
 use screenpatch::core::geometry::{
     logical_client_keeping_physical, logical_to_physical_px, logical_window_size,
     one_to_one_physical_size, place_window, shift_into_work_area, CaptureRect, LogicalRect,
-    WorkArea,
+    WorkArea, HELP_CLIENT_HEIGHT, HELP_CLIENT_WIDTH, help_window_origin, index_containing_point,
 };
 use screenpatch::core::patches::{
     letterbox, AddPatchError, CommitRefreshError, PatchManager,
@@ -39,9 +41,9 @@ use screenpatch::core::selection::{
 };
 use screenpatch::platform::{
     acquire_single_instance, capture_monitor_region, choose_png_path, confirm_close_all,
-    hwnd_from_window, list_displays, read_saved_language, suggested_png_name,
-    system_ui_language, try_exclude_from_capture, wait_until_hidden, write_saved_language,
-    DisplayInfo, Hwnd,
+    cursor_screen_point, hwnd_from_window, list_displays, paint_help, read_saved_language,
+    suggested_png_name, system_ui_language, try_exclude_from_capture, wait_until_hidden,
+    write_saved_language, DisplayInfo, Hwnd,
 };
 
 struct PreparedOverlay {
@@ -94,6 +96,23 @@ struct PatchWindow {
     physical_client: (u32, u32),
 }
 
+struct TrayMenus {
+    // Эти поля не читаются: они держат пункты живыми, пока меню висит в трее.
+    #[allow(dead_code)]
+    items: Vec<MenuItem>,
+    #[allow(dead_code)]
+    language_menu: Submenu,
+    russian: CheckMenuItem,
+    english: CheckMenuItem,
+}
+
+struct HelpWindow {
+    window: Arc<Window>,
+    surface: softbuffer::Surface<Arc<Window>, Arc<Window>>,
+    #[allow(dead_code)]
+    context: softbuffer::Context<Arc<Window>>,
+}
+
 struct App {
     prepared: Option<Vec<PreparedOverlay>>,
     overlays: Vec<OverlayWindow>,
@@ -104,7 +123,8 @@ struct App {
     started: bool,
     startup_error: Option<String>,
     tray: Option<TrayIcon>,
-    menu_items: Vec<MenuItem>,
+    tray_menus: Option<TrayMenus>,
+    help: Option<HelpWindow>,
     hotkeys: Option<GlobalHotKeyManager>,
     hotkey_id: u32,
     language: Language,
@@ -149,7 +169,8 @@ fn run() -> Result<(), String> {
         started: false,
         startup_error: None,
         tray: None,
-        menu_items: Vec::new(),
+        tray_menus: None,
+        help: None,
         hotkeys: None,
         hotkey_id: 0,
         language,
@@ -258,6 +279,14 @@ impl ApplicationHandler for App {
         window_id: WindowId,
         event: WindowEvent,
     ) {
+        if self
+            .help
+            .as_ref()
+            .is_some_and(|help| help.window.id() == window_id)
+        {
+            self.help_event(event);
+            return;
+        }
         if self.overlay_index(window_id).is_some() {
             self.overlay_event(event_loop, window_id, event);
             return;
@@ -1132,45 +1161,78 @@ impl App {
         }
     }
 
-    fn tray_menu(&self) -> Result<(Menu, Vec<MenuItem>), String> {
+    fn tray_menu(&self) -> Result<(Menu, TrayMenus), String> {
         let menu = Menu::new();
         let items = vec![
             MenuItem::with_id("new", self.say(language::TRAY_NEW), true, None),
             MenuItem::with_id("show", self.say(language::TRAY_SHOW), true, None),
             MenuItem::with_id("hide", self.say(language::TRAY_HIDE), true, None),
             MenuItem::with_id("close-all", self.say(language::TRAY_CLOSE_ALL), true, None),
-            MenuItem::with_id("language", self.say(language::TRAY_OTHER_LANGUAGE), true, None),
+            MenuItem::with_id("help", self.say(language::TRAY_HELP), true, None),
             MenuItem::with_id("exit", self.say(language::TRAY_EXIT), true, None),
         ];
-        let separator = tray_icon::menu::PredefinedMenuItem::separator();
+        let russian = CheckMenuItem::with_id(
+            "lang-ru",
+            LANGUAGE_NAME_RU,
+            true,
+            self.language == Language::Ru,
+            None,
+        );
+        let english = CheckMenuItem::with_id(
+            "lang-en",
+            LANGUAGE_NAME_EN,
+            true,
+            self.language == Language::En,
+            None,
+        );
+        let language_menu = Submenu::with_id_and_items(
+            "language",
+            self.say(language::TRAY_LANGUAGE),
+            true,
+            &[&russian, &english],
+        )
+        .map_err(|err| self.fill(language::MENU_FAILED, &[("err", &err.to_string())]))?;
+        let above = PredefinedMenuItem::separator();
+        let below = PredefinedMenuItem::separator();
         let refs: Vec<&dyn tray_icon::menu::IsMenuItem> = vec![
             &items[0],
             &items[1],
             &items[2],
             &items[3],
+            &above,
+            &language_menu,
             &items[4],
-            &separator,
+            &below,
             &items[5],
         ];
         menu.append_items(&refs)
             .map_err(|err| self.fill(language::MENU_FAILED, &[("err", &err.to_string())]))?;
-        Ok((menu, items))
+        Ok((
+            menu,
+            TrayMenus {
+                items,
+                language_menu,
+                russian,
+                english,
+            },
+        ))
     }
 
     fn replace_tray_menu(&mut self) -> Result<(), String> {
-        let (menu, items) = self.tray_menu()?;
+        let (menu, menus) = self.tray_menu()?;
         if let Some(tray) = &self.tray {
             tray.set_menu(Some(Box::new(menu)));
         }
-        self.menu_items = items;
+        self.tray_menus = Some(menus);
         Ok(())
     }
 
-    fn switch_language(&mut self) {
-        self.language = match self.language {
-            Language::Ru => Language::En,
-            Language::En => Language::Ru,
+    fn choose_language(&mut self, picked: Language) {
+        let Some(next) = language_choice(self.language, picked) else {
+            self.restore_language_checks();
+            return;
         };
+        self.language = next;
         if let Err(err) = write_saved_language(self.language) {
             eprintln!(
                 "{}",
@@ -1178,15 +1240,27 @@ impl App {
             );
         }
         if let Err(err) = self.replace_tray_menu() {
-            eprintln!("{}", err);
+            eprintln!("{err}");
         }
         for patch in &self.windows {
             patch.window.request_redraw();
         }
+        if let Some(help) = &self.help {
+            help.window.set_title(self.say(language::TRAY_HELP));
+            help.window.request_redraw();
+        }
+    }
+
+    fn restore_language_checks(&self) {
+        let Some(menus) = &self.tray_menus else {
+            return;
+        };
+        menus.russian.set_checked(self.language == Language::Ru);
+        menus.english.set_checked(self.language == Language::En);
     }
 
     fn install_shell(&mut self) -> Result<(), String> {
-        let (menu, items) = self.tray_menu()?;
+        let (menu, menus) = self.tray_menu()?;
         let source = tray_icon_source(self.language)?;
         let icon = Icon::from_rgba(source.pixels, source.width, source.height)
             .map_err(|err| self.fill(language::ICON_CREATE_FAILED, &[("err", &err.to_string())]))?;
@@ -1196,7 +1270,7 @@ impl App {
             .with_icon(icon)
             .build()
             .map_err(|err| self.fill(language::TRAY_CREATE_FAILED, &[("err", &err.to_string())]))?;
-        self.menu_items = items;
+        self.tray_menus = Some(menus);
         self.tray = Some(tray);
         match register_hotkey() {
             Ok((manager, id)) => {
@@ -1234,11 +1308,151 @@ impl App {
             self.set_patch_visibility(false);
         } else if id == "close-all" {
             self.close_all_patches();
-        } else if id == "language" {
-            self.switch_language();
+        } else if id == "lang-ru" {
+            self.choose_language(Language::Ru);
+        } else if id == "lang-en" {
+            self.choose_language(Language::En);
+        } else if id == "help" {
+            self.open_help(event_loop);
         } else if id == "exit" {
             self.exit_app(event_loop);
         }
+    }
+
+    fn open_help(&mut self, event_loop: &ActiveEventLoop) {
+        if let Some(help) = &self.help {
+            help.window.set_minimized(false);
+            help.window.set_visible(true);
+            help.window.focus_window();
+            return;
+        }
+        let displays = match list_displays(self.language) {
+            Ok(displays) if !displays.is_empty() => displays,
+            Ok(_) => {
+                eprintln!("{}", self.say(language::NO_MONITORS));
+                return;
+            }
+            Err(err) => {
+                eprintln!("{}", err.message);
+                return;
+            }
+        };
+        let Some(index) = help_display_index(&displays) else {
+            eprintln!("{}", self.say(language::WORK_AREA_SCALE));
+            return;
+        };
+        let display = &displays[index];
+        let (local_x, local_y) = help_window_origin(display.work);
+        let Some(offset_x) = logical_to_physical_px(local_x, display.scale) else {
+            eprintln!("{}", self.say(language::WORK_AREA_SCALE));
+            return;
+        };
+        let Some(offset_y) = logical_to_physical_px(local_y, display.scale) else {
+            eprintln!("{}", self.say(language::WORK_AREA_SCALE));
+            return;
+        };
+        let Some(position_x) = display.origin_x.checked_add(offset_x) else {
+            eprintln!("{}", self.say(language::WORK_AREA_SCALE));
+            return;
+        };
+        let Some(position_y) = display.origin_y.checked_add(offset_y) else {
+            eprintln!("{}", self.say(language::WORK_AREA_SCALE));
+            return;
+        };
+        let attributes = apply_window_icon(
+            self.language,
+            WindowAttributes::default()
+                .with_title(self.say(language::TRAY_HELP))
+                .with_resizable(false)
+                .with_inner_size(LogicalSize::new(
+                    HELP_CLIENT_WIDTH as f64,
+                    HELP_CLIENT_HEIGHT as f64,
+                ))
+                .with_position(PhysicalPosition::new(position_x, position_y)),
+        );
+        let window = match event_loop.create_window(attributes) {
+            Ok(window) => Arc::new(window),
+            Err(err) => {
+                eprintln!(
+                    "{}",
+                    self.fill(language::WINDOW_CREATE_FAILED, &[("err", &err.to_string())])
+                );
+                return;
+            }
+        };
+        let context = match softbuffer::Context::new(Arc::clone(&window)) {
+            Ok(context) => context,
+            Err(err) => {
+                eprintln!(
+                    "{}",
+                    self.fill(language::WINDOW_BUFFER_FAILED, &[("err", &err.to_string())])
+                );
+                return;
+            }
+        };
+        let surface = match softbuffer::Surface::new(&context, Arc::clone(&window)) {
+            Ok(surface) => surface,
+            Err(err) => {
+                eprintln!(
+                    "{}",
+                    self.fill(language::WINDOW_SURFACE_FAILED, &[("err", &err.to_string())])
+                );
+                return;
+            }
+        };
+        window.request_redraw();
+        self.help = Some(HelpWindow {
+            window,
+            surface,
+            context,
+        });
+    }
+
+    fn help_event(&mut self, event: WindowEvent) {
+        match event {
+            WindowEvent::CloseRequested => self.help = None,
+            WindowEvent::KeyboardInput {
+                event,
+                is_synthetic,
+                ..
+            } => {
+                if event.state != ElementState::Pressed || event.repeat || is_synthetic {
+                    return;
+                }
+                if event.logical_key == Key::Named(NamedKey::Escape) {
+                    self.help = None;
+                }
+            }
+            WindowEvent::RedrawRequested => self.paint_help_window(),
+            WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
+                if let Some(help) = &self.help {
+                    help.window.request_redraw();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn paint_help_window(&mut self) {
+        let Some(window) = self.help.as_ref().map(|help| Arc::clone(&help.window)) else {
+            return;
+        };
+        let size = window.inner_size();
+        let pixels = paint_help(
+            size.width,
+            size.height,
+            window.scale_factor(),
+            help_lines(self.language),
+        );
+        let frame = ImageFrame {
+            pixels: Arc::from(pixels.into_boxed_slice()),
+            width: size.width,
+            height: size.height,
+        };
+        let Some(help) = &mut self.help else {
+            return;
+        };
+        present_frame(&window, &mut help.surface, &frame);
     }
 
     fn set_patch_visibility(&mut self, visible: bool) {
@@ -1267,6 +1481,7 @@ impl App {
         self.overlays.clear();
         self.windows.clear();
         self.patches.close_all(true);
+        self.help = None;
         self.tray = None;
         event_loop.exit();
     }
@@ -1516,6 +1731,49 @@ fn patch_add_error(language: Language, frame: &ImageFrame, err: AddPatchError) -
                 ("used", &used_bytes.to_string()),
             ],
         ),
+    }
+}
+
+fn absolute_work(display: &DisplayInfo) -> Option<(i32, i32, u32, u32)> {
+    let x = display
+        .origin_x
+        .checked_add(logical_to_physical_px(display.work.x, display.scale)?)?;
+    let y = display
+        .origin_y
+        .checked_add(logical_to_physical_px(display.work.y, display.scale)?)?;
+    let width = u32::try_from(logical_to_physical_px(
+        i32::try_from(display.work.width).ok()?,
+        display.scale,
+    )?)
+    .ok()?;
+    let height = u32::try_from(logical_to_physical_px(
+        i32::try_from(display.work.height).ok()?,
+        display.scale,
+    )?)
+    .ok()?;
+    Some((x, y, width, height))
+}
+
+fn help_display_index(displays: &[DisplayInfo]) -> Option<usize> {
+    let mut placed = Vec::new();
+    for (index, display) in displays.iter().enumerate() {
+        if let Some(rect) = absolute_work(display) {
+            placed.push((index, rect));
+        }
+    }
+    if placed.is_empty() {
+        return None;
+    }
+    let rects: Vec<_> = placed.iter().map(|(_, rect)| *rect).collect();
+    if let Some((x, y)) = cursor_screen_point() {
+        if let Some(hit) = index_containing_point(x, y, &rects) {
+            return Some(placed[hit].0);
+        }
+    }
+    if absolute_work(&displays[0]).is_some() {
+        Some(0)
+    } else {
+        Some(placed[0].0)
     }
 }
 

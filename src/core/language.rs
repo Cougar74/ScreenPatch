@@ -33,14 +33,70 @@ pub fn parse_saved_language(text: &str) -> Option<Language> {
     }
 }
 
+const HELP_LINES_RU: [&str; 12] = [
+    "Горячие клавиши",
+    "Ctrl+Shift+S — новый снимок",
+    "  ",
+    "В окне снимка",
+    "R — обновить",
+    "1 — размер кадра",
+    "S — новый снимок",
+    "Esc — закрыть снимок",
+    "  ",
+    "Мышь",
+    "Правый клик — показать или скрыть кнопки",
+    "Перетаскивание — двигать окно",
+];
+
+const HELP_LINES_EN: [&str; 12] = [
+    "Hotkeys",
+    "Ctrl+Shift+S — new capture",
+    "  ",
+    "In a capture window",
+    "R — refresh",
+    "1 — frame size",
+    "S — new capture",
+    "Esc — close the capture",
+    "  ",
+    "Mouse",
+    "Right-click — show or hide the buttons",
+    "Drag — move the window",
+];
+
+pub fn help_lines(language: Language) -> &'static [&'static str; 12] {
+    match language {
+        Language::Ru => &HELP_LINES_RU,
+        Language::En => &HELP_LINES_EN,
+    }
+}
+
+pub fn help_key(line: &str) -> Option<&str> {
+    for key in ["Ctrl+Shift+S", "Esc", "R", "S", "1"] {
+        if let Some(rest) = line.strip_prefix(key) {
+            if rest.starts_with(" — ") {
+                return Some(key);
+            }
+        }
+    }
+    None
+}
+
+pub fn language_choice(current: Language, picked: Language) -> Option<Language> {
+    if current == picked {
+        None
+    } else {
+        Some(picked)
+    }
+}
+
 pub const TRAY_NEW: Phrase = Phrase { ru: "Новый снимок", en: "New capture" };
 pub const TRAY_SHOW: Phrase = Phrase { ru: "Показать все", en: "Show all" };
 pub const TRAY_HIDE: Phrase = Phrase { ru: "Скрыть все", en: "Hide all" };
 pub const TRAY_CLOSE_ALL: Phrase = Phrase { ru: "Закрыть все снимки", en: "Close all captures" };
-pub const TRAY_OTHER_LANGUAGE: Phrase = Phrase {
-    ru: "Переключить на English",
-    en: "Change to Русский",
-};
+pub const TRAY_LANGUAGE: Phrase = Phrase { ru: "Язык", en: "Language" };
+pub const TRAY_HELP: Phrase = Phrase { ru: "Справка", en: "Help" };
+pub const LANGUAGE_NAME_RU: &str = "Русский";
+pub const LANGUAGE_NAME_EN: &str = "English";
 pub const TRAY_EXIT: Phrase = Phrase { ru: "Выход", en: "Exit" };
 pub const STRIP_REFRESH: Phrase = Phrase { ru: "Обновить", en: "Refresh" };
 pub const STRIP_BEFORE_AFTER: Phrase = Phrase { ru: "До/после", en: "Before/after" };
