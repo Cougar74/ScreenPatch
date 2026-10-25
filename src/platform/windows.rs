@@ -9,9 +9,9 @@ use windows::Win32::Foundation::{
     RECT, SIZE, WIN32_ERROR,
 };
 use windows::Win32::Graphics::Gdi::{
-    CreateCompatibleDC, CreateDIBSection, CreateFontW, DeleteDC, DeleteObject, DrawTextW,
+    CreateCompatibleDC, CreateDIBSection, CreateFontW, CreateRoundRectRgn, DeleteDC, DeleteObject, DrawTextW,
     EnumDisplayMonitors, GetMonitorInfoW, GetTextExtentPoint32W, SelectObject, SetBkMode,
-    SetTextColor, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS,
+    SetTextColor, SetWindowRgn, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS,
     DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_TOP,
     FF_DONTCARE, FW_BOLD, FW_NORMAL, OUT_DEFAULT_PRECIS, HDC, HFONT, HGDIOBJ, HMONITOR, MONITORINFO,
     TRANSPARENT,
@@ -23,9 +23,11 @@ use windows::Win32::UI::Controls::Dialogs::{
     CommDlgExtendedError, GetSaveFileNameW, OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST, OPENFILENAMEW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, GetCursorPos, IsWindowVisible, MessageBoxW, MsgWaitForMultipleObjects,
-    PeekMessageW, SetWindowDisplayAffinity, TranslateMessage, IDYES, MB_ICONQUESTION, MB_YESNO,
-    MSG, PM_REMOVE, QS_ALLINPUT, WDA_EXCLUDEFROMCAPTURE,
+    DispatchMessageW, GetCursorPos, GetWindowLongPtrW, GWL_EXSTYLE, HWND_TOPMOST, IsWindowVisible,
+    MessageBoxW, MsgWaitForMultipleObjects, PeekMessageW, SWP_NOACTIVATE, SetWindowDisplayAffinity,
+    SetWindowLongPtrW, SetWindowPos, TranslateMessage, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WS_EX_TRANSPARENT, IDYES, MB_ICONQUESTION, MB_YESNO, MSG, PM_REMOVE, QS_ALLINPUT,
+    WDA_EXCLUDEFROMCAPTURE,
 };
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use xcap::Monitor;
@@ -465,6 +467,153 @@ pub fn paint_help(width: u32, height: u32, scale: f64, lines: &[&str; 12]) -> Ve
     }
     unsafe { draw_help_lines(&mut rgba, width, height, scale, lines) };
     rgba
+}
+
+pub fn measure_tooltip_text(scale: f64, text: &str) -> Option<(i32, i32)> {
+    unsafe { tooltip_extent(scale, text) }
+}
+
+pub fn paint_tooltip(width: u32, height: u32, scale: f64, text: &str) -> Vec<u8> {
+    let pixels = (width as usize).saturating_mul(height as usize).saturating_mul(4);
+    let mut rgba = vec![32u8, 32, 32, 255].repeat(pixels / 4);
+    if width == 0 || height == 0 {
+        return rgba;
+    }
+    unsafe { draw_tooltip(&mut rgba, width, height, scale, text) };
+    rgba
+}
+
+pub fn make_tooltip_click_through(hwnd: Hwnd) -> bool {
+    let handle = HWND(hwnd.0 as *mut c_void);
+    unsafe {
+        SetLastError(WIN32_ERROR(0));
+        let previous = GetWindowLongPtrW(handle, GWL_EXSTYLE);
+        let extra = WS_EX_NOACTIVATE.0 | WS_EX_TOOLWINDOW.0 | WS_EX_TRANSPARENT.0;
+        let next = previous | isize::try_from(extra).unwrap_or(isize::MAX);
+        let written = SetWindowLongPtrW(handle, GWL_EXSTYLE, next);
+        written != 0 || GetLastError().0 == 0
+    }
+}
+
+pub fn place_tooltip_window(hwnd: Hwnd, x: i32, y: i32, width: i32, height: i32) -> bool {
+    let handle = HWND(hwnd.0 as *mut c_void);
+    unsafe {
+        SetWindowPos(
+            handle,
+            Some(HWND_TOPMOST),
+            x,
+            y,
+            width,
+            height,
+            SWP_NOACTIVATE,
+        )
+        .is_ok()
+    }
+}
+
+pub fn round_tooltip_window(hwnd: Hwnd, width: i32, height: i32, radius: i32) -> bool {
+    let width = width.max(1);
+    let height = height.max(1);
+    let radius = radius.max(1).min(width / 2).min(height / 2);
+    let handle = HWND(hwnd.0 as *mut c_void);
+    unsafe {
+        let region = CreateRoundRectRgn(0, 0, width, height, radius.saturating_mul(2), radius.saturating_mul(2));
+        if region.is_invalid() {
+            return false;
+        }
+        if SetWindowRgn(handle, Some(region), true) == 0 {
+            let _ = DeleteObject(HGDIOBJ::from(region));
+            return false;
+        }
+        true
+    }
+}
+
+unsafe fn tooltip_extent(scale: f64, text: &str) -> Option<(i32, i32)> {
+    let dc = CreateCompatibleDC(None);
+    if dc.is_invalid() {
+        return None;
+    }
+    let font_height = -logical_to_physical_px(16, scale).unwrap_or(16);
+    let font = help_font(font_height, FW_NORMAL.0 as i32);
+    if font.is_invalid() {
+        let _ = DeleteDC(dc);
+        return None;
+    }
+    let font_object = HGDIOBJ::from(font);
+    let previous = SelectObject(dc, font_object);
+    let measured: Vec<u16> = text.encode_utf16().collect();
+    let mut extent = SIZE { cx: 0, cy: 0 };
+    let ok = GetTextExtentPoint32W(dc, &measured, &mut extent).as_bool();
+    let _ = SelectObject(dc, previous);
+    let _ = DeleteObject(font_object);
+    let _ = DeleteDC(dc);
+    if !ok || extent.cx <= 0 || extent.cy <= 0 {
+        None
+    } else {
+        Some((extent.cx, extent.cy))
+    }
+}
+
+unsafe fn draw_tooltip(rgba: &mut [u8], width: u32, height: u32, scale: f64, text: &str) {
+    let dc = CreateCompatibleDC(None);
+    if dc.is_invalid() {
+        return;
+    }
+    let info = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: width as i32,
+            biHeight: -(height as i32),
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut bits: *mut c_void = std::ptr::null_mut();
+    let bitmap = CreateDIBSection(Some(dc), &info, DIB_RGB_COLORS, &mut bits, None, 0);
+    if bitmap.is_err() || bits.is_null() {
+        let _ = DeleteDC(dc);
+        return;
+    }
+    let bitmap = bitmap.unwrap_or_default();
+    let bitmap_object = HGDIOBJ::from(bitmap);
+    let previous = SelectObject(dc, bitmap_object);
+    let count = (width as usize).saturating_mul(height as usize).saturating_mul(4);
+    let source = std::slice::from_raw_parts_mut(bits as *mut u8, count.min(rgba.len()));
+    for pixel in source.chunks_exact_mut(4) {
+        pixel.copy_from_slice(&[32, 32, 32, 255]);
+    }
+    let font_height = -logical_to_physical_px(16, scale).unwrap_or(16);
+    let font = help_font(font_height, FW_NORMAL.0 as i32);
+    if !font.is_invalid() {
+        let font_object = HGDIOBJ::from(font);
+        let previous_font = SelectObject(dc, font_object);
+        let _ = SetBkMode(dc, TRANSPARENT);
+        let _ = SetTextColor(dc, COLORREF(0x00FF_FFFF));
+        let pad_x = logical_to_physical_px(8, scale).unwrap_or(8);
+        let pad_y = logical_to_physical_px(4, scale).unwrap_or(4);
+        let mut bounds = RECT {
+            left: pad_x,
+            top: pad_y,
+            right: width as i32 - pad_x,
+            bottom: height as i32 - pad_y,
+        };
+        draw_help_text(dc, text, &mut bounds);
+        let _ = SelectObject(dc, previous_font);
+        let _ = DeleteObject(font_object);
+    }
+    for (rgba_pixel, bgra) in rgba.chunks_exact_mut(4).zip(source.chunks_exact(4)) {
+        rgba_pixel[0] = bgra[2];
+        rgba_pixel[1] = bgra[1];
+        rgba_pixel[2] = bgra[0];
+        rgba_pixel[3] = 255;
+    }
+    let _ = SelectObject(dc, previous);
+    let _ = DeleteObject(bitmap_object);
+    let _ = DeleteDC(dc);
 }
 
 unsafe fn draw_help_lines(rgba: &mut [u8], width: u32, height: u32, scale: f64, lines: &[&str; 12]) {

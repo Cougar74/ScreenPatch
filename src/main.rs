@@ -2,6 +2,7 @@
 
 use std::num::NonZeroU32;
 use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
 use global_hotkey::{
     hotkey::{Code, HotKey, Modifiers},
@@ -26,6 +27,10 @@ use screenpatch::core::commands::{
 use screenpatch::core::language::{
     self, help_lines, language_choice, Language, LANGUAGE_NAME_EN, LANGUAGE_NAME_RU,
 };
+use screenpatch::core::tooltip::{
+    button_tip, note_hover, tooltip_client_size, tooltip_due, tooltip_origin, TooltipHover,
+    TOOLTIP_DELAY,
+};
 use screenpatch::core::geometry::{
     logical_client_keeping_physical, logical_to_physical_px, logical_window_size,
     one_to_one_physical_size, place_window, shift_into_work_area, CaptureRect, LogicalRect,
@@ -41,8 +46,10 @@ use screenpatch::core::selection::{
 };
 use screenpatch::platform::{
     acquire_single_instance, capture_monitor_region, choose_png_path, confirm_close_all,
-    cursor_screen_point, hwnd_from_window, list_displays, paint_help, read_saved_language,
-    suggested_png_name, system_ui_language, try_exclude_from_capture, wait_until_hidden,
+    cursor_screen_point, hwnd_from_window, list_displays, make_tooltip_click_through,
+    measure_tooltip_text, paint_help, paint_tooltip, place_tooltip_window, read_saved_language,
+    round_tooltip_window, suggested_png_name, system_ui_language, try_exclude_from_capture,
+    wait_until_hidden,
     write_saved_language, DisplayInfo, Hwnd,
 };
 
@@ -113,6 +120,23 @@ struct HelpWindow {
     context: softbuffer::Context<Arc<Window>>,
 }
 
+struct TooltipWindow {
+    window: Arc<Window>,
+    surface: softbuffer::Surface<Arc<Window>, Arc<Window>>,
+    #[allow(dead_code)]
+    context: softbuffer::Context<Arc<Window>>,
+    affinity: bool,
+    click_through: bool,
+}
+
+struct TooltipLayout {
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    radius: i32,
+}
+
 struct App {
     prepared: Option<Vec<PreparedOverlay>>,
     overlays: Vec<OverlayWindow>,
@@ -125,6 +149,13 @@ struct App {
     tray: Option<TrayIcon>,
     tray_menus: Option<TrayMenus>,
     help: Option<HelpWindow>,
+    tooltip: Option<TooltipWindow>,
+    tooltip_hover: Option<TooltipHover<WindowId>>,
+    tooltip_create_logged: bool,
+    tooltip_hwnd_logged: bool,
+    tooltip_style_logged: bool,
+    tooltip_buffer_logged: bool,
+    tooltip_surface_logged: bool,
     hotkeys: Option<GlobalHotKeyManager>,
     hotkey_id: u32,
     language: Language,
@@ -171,6 +202,13 @@ fn run() -> Result<(), String> {
         tray: None,
         tray_menus: None,
         help: None,
+        tooltip: None,
+        tooltip_hover: None,
+        tooltip_create_logged: false,
+        tooltip_hwnd_logged: false,
+        tooltip_style_logged: false,
+        tooltip_buffer_logged: false,
+        tooltip_surface_logged: false,
         hotkeys: None,
         hotkey_id: 0,
         language,
@@ -271,6 +309,7 @@ impl ApplicationHandler for App {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.poll_shell(event_loop);
+        self.sync_tooltip(event_loop, None, false);
     }
 
     fn window_event(
@@ -279,6 +318,14 @@ impl ApplicationHandler for App {
         window_id: WindowId,
         event: WindowEvent,
     ) {
+        if self
+            .tooltip
+            .as_ref()
+            .is_some_and(|tooltip| tooltip.window.id() == window_id)
+        {
+            self.tooltip_event(event_loop, event);
+            return;
+        }
         if self
             .help
             .as_ref()
@@ -328,9 +375,11 @@ impl ApplicationHandler for App {
                 if self.windows[index].strip_press.is_some() {
                     self.windows[index].window.request_redraw();
                 }
+                self.sync_tooltip(event_loop, Some(index), true);
             }
             WindowEvent::CursorLeft { .. } => {
                 self.windows[index].cursor = None;
+                self.clear_tooltip();
                 if self.windows[index].strip_press.is_some() {
                     self.windows[index].window.request_redraw();
                 }
@@ -758,11 +807,21 @@ impl App {
         }
 
         let hide = !self.windows[index].affinity;
-        let hwnds: Vec<Hwnd> = self
+        let mut hwnds: Vec<Hwnd> = self
             .windows
             .iter()
             .filter_map(|patch| hwnd_from_window(&patch.window))
             .collect();
+        let tooltip_hidden = self.conceal_tooltip_for_capture();
+        if tooltip_hidden {
+            if let Some(hwnd) = self
+                .tooltip
+                .as_ref()
+                .and_then(|tooltip| hwnd_from_window(&tooltip.window))
+            {
+                hwnds.push(hwnd);
+            }
+        }
         let restore_windows: Vec<(Arc<Window>, bool)> = self
             .windows
             .iter()
@@ -787,7 +846,7 @@ impl App {
             true,
             hide,
             || {
-                if hide && wait_until_hidden(&hwnds).is_err() {
+                if (hide || tooltip_hidden) && !hwnds.is_empty() && wait_until_hidden(&hwnds).is_err() {
                     log_refresh_cancel(
                         self.language,
                         &monitor_for_log,
@@ -814,6 +873,7 @@ impl App {
             },
         );
         self.windows[index].refreshing = false;
+        self.reveal_tooltip_after_capture();
         let Some(frame) = captured else {
             return;
         };
@@ -943,6 +1003,7 @@ impl App {
     fn toggle_strip(&mut self, index: usize) {
         self.windows[index].strip_press = None;
         self.windows[index].strip_visible = !self.windows[index].strip_visible;
+        self.clear_tooltip();
         self.windows[index].window.request_redraw();
     }
 
@@ -961,6 +1022,12 @@ impl App {
         {
             self.corner = None;
         }
+        if self
+            .tooltip_hover
+            .is_some_and(|hover| hover.window == window_id)
+        {
+            self.clear_tooltip();
+        }
         self.patches.close(number);
         self.windows.remove(index);
     }
@@ -973,6 +1040,7 @@ impl App {
             eprintln!("{}", self.say(language::WINDOW_LIMIT));
             return;
         }
+        self.clear_tooltip();
         let remembered: Vec<(Arc<Window>, bool)> = self
             .windows
             .iter()
@@ -1005,6 +1073,7 @@ impl App {
         for (window, visible) in remembered {
             window.set_visible(*visible);
         }
+        self.reveal_tooltip_after_capture();
     }
 
     fn capture_prepared(&mut self) -> Result<Vec<PreparedOverlay>, String> {
@@ -1019,15 +1088,24 @@ impl App {
                 )
             })
             .collect();
-        let hwnds: Vec<Hwnd> = hidden
+        let mut hwnds: Vec<Hwnd> = hidden
             .iter()
             .filter_map(|(window, _)| hwnd_from_window(window))
             .collect();
+        if self.conceal_tooltip_for_capture() {
+            if let Some(hwnd) = self
+                .tooltip
+                .as_ref()
+                .and_then(|tooltip| hwnd_from_window(&tooltip.window))
+            {
+                hwnds.push(hwnd);
+            }
+        }
         for (window, _) in &hidden {
             window.set_visible(false);
         }
         let result = (|| {
-            if !hidden.is_empty() && wait_until_hidden(&hwnds).is_err() {
+            if !hwnds.is_empty() && wait_until_hidden(&hwnds).is_err() {
                 return Err(self.say(language::HIDE_FAILED).to_string());
             }
             let displays = list_displays(self.language).map_err(|err| {
@@ -1038,6 +1116,7 @@ impl App {
         for (window, visible) in &hidden {
             window.set_visible(*visible);
         }
+        self.reveal_tooltip_after_capture();
         result
     }
 
@@ -1249,6 +1328,9 @@ impl App {
             help.window.set_title(self.say(language::TRAY_HELP));
             help.window.request_redraw();
         }
+        if self.tooltip_hover.is_some_and(|hover| hover.shown) {
+            let _ = self.relayout_tooltip();
+        }
     }
 
     fn restore_language_checks(&self) {
@@ -1455,7 +1537,339 @@ impl App {
         present_frame(&window, &mut help.surface, &frame);
     }
 
+    fn tooltip_event(&mut self, event_loop: &ActiveEventLoop, event: WindowEvent) {
+        match event {
+            WindowEvent::RedrawRequested => self.paint_tooltip_window(),
+            WindowEvent::ScaleFactorChanged { .. } => self.sync_tooltip(event_loop, None, true),
+            _ => {}
+        }
+    }
+
+    fn sync_tooltip(&mut self, event_loop: &ActiveEventLoop, source: Option<usize>, force_place: bool) {
+        self.capture_hover(source);
+        let Some(hover) = self.tooltip_hover else {
+            self.hide_tooltip_window();
+            event_loop.set_control_flow(ControlFlow::Wait);
+            return;
+        };
+        let due = hover.shown || tooltip_due(&hover, Instant::now());
+        if !due {
+            self.hide_tooltip_window();
+            event_loop.set_control_flow(ControlFlow::WaitUntil(hover.started + TOOLTIP_DELAY));
+            return;
+        }
+        if hover.shown && !force_place {
+            event_loop.set_control_flow(ControlFlow::Wait);
+            return;
+        }
+        if self.present_tooltip(event_loop) {
+            if let Some(hover) = &mut self.tooltip_hover {
+                hover.shown = true;
+            }
+        }
+        event_loop.set_control_flow(ControlFlow::Wait);
+    }
+
+    fn capture_hover(&mut self, source: Option<usize>) {
+        let index = match source {
+            Some(index) => Some(index),
+            None => self.tooltip_hover.as_ref().and_then(|hover| {
+                self.windows
+                    .iter()
+                    .position(|patch| patch.window.id() == hover.window)
+            }),
+        };
+        let Some(index) = index.filter(|index| *index < self.windows.len()) else {
+            self.tooltip_hover = None;
+            return;
+        };
+        let window_id = self.windows[index].window.id();
+        let (width, height) = logical_client_size(&self.windows[index].window);
+        let action = self.windows[index].cursor.and_then(|(x, y)| {
+            let hit = client_hit(x, y, width, height, self.windows[index].strip_visible);
+            button_tip(hit).map(|_| hit)
+        });
+        let Some(action) = action else {
+            self.tooltip_hover = None;
+            return;
+        };
+        self.tooltip_hover = Some(note_hover(
+            self.tooltip_hover,
+            window_id,
+            action,
+            Instant::now(),
+        ));
+    }
+
+    fn clear_tooltip(&mut self) {
+        self.tooltip_hover = None;
+        self.hide_tooltip_window();
+    }
+
+    fn hide_tooltip_window(&self) {
+        if let Some(tooltip) = &self.tooltip {
+            tooltip.window.set_visible(false);
+        }
+    }
+
+    fn conceal_tooltip_for_capture(&mut self) -> bool {
+        let Some(tooltip) = &self.tooltip else {
+            return false;
+        };
+        if tooltip.affinity {
+            return false;
+        }
+        tooltip.window.set_visible(false);
+        true
+    }
+
+    fn reveal_tooltip_after_capture(&mut self) {
+        self.capture_hover(None);
+        let show = self
+            .tooltip_hover
+            .is_some_and(|hover| hover.shown || tooltip_due(&hover, Instant::now()));
+        if show {
+            let _ = self.relayout_tooltip();
+        } else {
+            self.hide_tooltip_window();
+        }
+    }
+
+    fn tooltip_layout(&self) -> Option<TooltipLayout> {
+        let hover = self.tooltip_hover?;
+        let cursor = cursor_screen_point()?;
+        let (scale, work) = self.tooltip_scale_and_work(cursor, hover.window)?;
+        let text = self.say(button_tip(hover.action)?);
+        let (text_width, text_height) = measure_tooltip_text(scale, text).unwrap_or_else(|| {
+            let px = logical_to_physical_px(16, scale).unwrap_or(16);
+            (px, px)
+        });
+        let pad_x = logical_to_physical_px(8, scale).unwrap_or(8);
+        let pad_y = logical_to_physical_px(4, scale).unwrap_or(4);
+        let (width, height) = tooltip_client_size(text_width, text_height, pad_x, pad_y);
+        let (x, y) = tooltip_origin(cursor.0, cursor.1, width, height, work);
+        let radius = logical_to_physical_px(8, scale).unwrap_or(8).max(1);
+        Some(TooltipLayout {
+            x,
+            y,
+            width,
+            height,
+            radius,
+        })
+    }
+
+    fn tooltip_scale_and_work(
+        &self,
+        cursor: (i32, i32),
+        window_id: WindowId,
+    ) -> Option<(f64, Option<(i32, i32, u32, u32)>)> {
+        let patch_scale = self
+            .windows
+            .iter()
+            .find(|patch| patch.window.id() == window_id)
+            .map(|patch| patch.window.scale_factor());
+        if let Ok(displays) = list_displays(self.language) {
+            let mut placed = Vec::new();
+            for display in &displays {
+                if let Some(rect) = absolute_work(display) {
+                    placed.push((display.scale, rect));
+                }
+            }
+            let rects: Vec<(i32, i32, u32, u32)> = placed.iter().map(|(_, rect)| *rect).collect();
+            if let Some(index) = index_containing_point(cursor.0, cursor.1, &rects) {
+                let (scale, rect) = placed[index];
+                if scale.is_finite() && scale > 0.0 {
+                    return Some((scale, Some(rect)));
+                }
+            }
+        }
+        let scale = patch_scale?;
+        if !scale.is_finite() || scale <= 0.0 {
+            return None;
+        }
+        Some((scale, None))
+    }
+
+    fn present_tooltip(&mut self, event_loop: &ActiveEventLoop) -> bool {
+        let Some(layout) = self.tooltip_layout() else {
+            return false;
+        };
+        if self.tooltip.is_none() && !self.create_tooltip(event_loop, &layout) {
+            return false;
+        }
+        self.apply_tooltip_layout(&layout)
+    }
+
+    fn relayout_tooltip(&mut self) -> bool {
+        let Some(layout) = self.tooltip_layout() else {
+            return false;
+        };
+        if self.tooltip.is_none() {
+            return false;
+        }
+        self.apply_tooltip_layout(&layout)
+    }
+
+    fn apply_tooltip_layout(&mut self, layout: &TooltipLayout) -> bool {
+        let click_through = self
+            .tooltip
+            .as_ref()
+            .is_some_and(|tooltip| tooltip.click_through);
+        if self.tooltip.is_none() || !click_through {
+            return false;
+        }
+        let hwnd = self
+            .tooltip
+            .as_ref()
+            .and_then(|tooltip| hwnd_from_window(&tooltip.window));
+        let Some(hwnd) = hwnd else {
+            self.log_tooltip_hwnd();
+            return false;
+        };
+        let width = u32::try_from(layout.width).unwrap_or(1).max(1);
+        let height = u32::try_from(layout.height).unwrap_or(1).max(1);
+        if !place_tooltip_window(hwnd, layout.x, layout.y, width as i32, height as i32) {
+            return false;
+        }
+        let _ = round_tooltip_window(hwnd, width as i32, height as i32, layout.radius);
+        let Some(window) = self.tooltip.as_ref().map(|tooltip| Arc::clone(&tooltip.window)) else {
+            return false;
+        };
+        let _ = window.request_inner_size(PhysicalSize::new(width, height));
+        window.set_visible(true);
+        window.request_redraw();
+        true
+    }
+
+    fn create_tooltip(&mut self, event_loop: &ActiveEventLoop, layout: &TooltipLayout) -> bool {
+        let width = u32::try_from(layout.width).unwrap_or(1).max(1);
+        let height = u32::try_from(layout.height).unwrap_or(1).max(1);
+        let attributes = WindowAttributes::default()
+            .with_title("ScreenPatch")
+            .with_decorations(false)
+            .with_resizable(false)
+            .with_visible(false)
+            .with_window_level(WindowLevel::AlwaysOnTop)
+            .with_inner_size(PhysicalSize::new(width, height))
+            .with_position(PhysicalPosition::new(layout.x, layout.y));
+        let window = match event_loop.create_window(attributes) {
+            Ok(window) => Arc::new(window),
+            Err(err) => {
+                self.log_tooltip_create(&err.to_string());
+                return false;
+            }
+        };
+        let context = match softbuffer::Context::new(Arc::clone(&window)) {
+            Ok(context) => context,
+            Err(err) => {
+                self.log_tooltip_buffer(&err.to_string());
+                return false;
+            }
+        };
+        let surface = match softbuffer::Surface::new(&context, Arc::clone(&window)) {
+            Ok(surface) => surface,
+            Err(err) => {
+                self.log_tooltip_surface(&err.to_string());
+                return false;
+            }
+        };
+        let Some(hwnd) = hwnd_from_window(&window) else {
+            self.log_tooltip_hwnd();
+            return false;
+        };
+        let affinity = try_exclude_from_capture(hwnd);
+        let click_through = make_tooltip_click_through(hwnd);
+        if !click_through {
+            self.log_tooltip_style();
+        }
+        self.tooltip = Some(TooltipWindow {
+            window,
+            surface,
+            context,
+            affinity,
+            click_through,
+        });
+        click_through
+    }
+
+    fn log_tooltip_create(&mut self, err: &str) {
+        if self.tooltip_create_logged {
+            return;
+        }
+        self.tooltip_create_logged = true;
+        eprintln!(
+            "{}",
+            self.fill(language::WINDOW_CREATE_FAILED, &[("err", err)])
+        );
+    }
+
+    fn log_tooltip_hwnd(&mut self) {
+        if self.tooltip_hwnd_logged {
+            return;
+        }
+        self.tooltip_hwnd_logged = true;
+        eprintln!("{}", self.say(language::NO_HWND));
+    }
+
+    fn log_tooltip_style(&mut self) {
+        if self.tooltip_style_logged {
+            return;
+        }
+        self.tooltip_style_logged = true;
+        eprintln!(
+            "{}",
+            self.fill(language::WINDOW_CREATE_FAILED, &[("err", "click-through")])
+        );
+    }
+
+    fn log_tooltip_buffer(&mut self, err: &str) {
+        if self.tooltip_buffer_logged {
+            return;
+        }
+        self.tooltip_buffer_logged = true;
+        eprintln!(
+            "{}",
+            self.fill(language::WINDOW_BUFFER_FAILED, &[("err", err)])
+        );
+    }
+
+    fn log_tooltip_surface(&mut self, err: &str) {
+        if self.tooltip_surface_logged {
+            return;
+        }
+        self.tooltip_surface_logged = true;
+        eprintln!(
+            "{}",
+            self.fill(language::WINDOW_SURFACE_FAILED, &[("err", err)])
+        );
+    }
+
+    fn paint_tooltip_window(&mut self) {
+        let Some(window) = self.tooltip.as_ref().map(|tooltip| Arc::clone(&tooltip.window)) else {
+            return;
+        };
+        let size = window.inner_size();
+        let text = self
+            .tooltip_hover
+            .and_then(|hover| button_tip(hover.action))
+            .map(|phrase| self.say(phrase))
+            .unwrap_or("");
+        let pixels = paint_tooltip(size.width, size.height, window.scale_factor(), text);
+        let frame = ImageFrame {
+            pixels: Arc::from(pixels.into_boxed_slice()),
+            width: size.width,
+            height: size.height,
+        };
+        let Some(tooltip) = &mut self.tooltip else {
+            return;
+        };
+        present_frame(&window, &mut tooltip.surface, &frame);
+    }
+
     fn set_patch_visibility(&mut self, visible: bool) {
+        if !visible {
+            self.clear_tooltip();
+        }
         self.patches.set_windows_visible(visible);
         for patch in &self.windows {
             patch.window.set_visible(visible);
@@ -1470,6 +1884,7 @@ impl App {
         if !confirm_close_all(parent, self.say(language::CLOSE_ALL_QUESTION)) {
             return;
         }
+        self.clear_tooltip();
         self.corner = None;
         self.windows.clear();
         self.patches.close_all(true);
@@ -1481,6 +1896,8 @@ impl App {
         self.overlays.clear();
         self.windows.clear();
         self.patches.close_all(true);
+        self.clear_tooltip();
+        self.tooltip = None;
         self.help = None;
         self.tray = None;
         event_loop.exit();
