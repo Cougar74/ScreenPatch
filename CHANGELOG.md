@@ -1,5 +1,14 @@
 ﻿# Changelog
 
+## 0.2.0
+
+The Windows binary is `release/ScreenPatch.exe`.
+
+- Capture buttons are round icons: refresh, before/after, copy, save, and close. Holding a button darkens it until release.
+- Right-click shows or hides those buttons. Dragging the picture still moves the window.
+- The tray language entry is a submenu, «Язык» or Language. It lists «Русский» and English, and the current one is checked.
+- «Справка» or Help opens one window with the hotkeys and mouse actions. The key combinations are bold. Esc or the close button dismisses it, and choosing Help again focuses the same window.
+
 ## 0.1.1
 
 The Windows binary is `release/ScreenPatch.exe`.
