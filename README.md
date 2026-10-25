@@ -1,55 +1,115 @@
-﻿# ScreenPatch
+<div align="center">
 
-[Русская версия](README.ru.md)
+# 📌 ScreenPatch
 
-Copyright 2026 Eduard
+### Keep what matters in sight.
 
-## What it does
+**Capture any part of your screen and keep it floating above your workspace.**  
+A lightweight, local-first Windows utility built with Rust.
 
-ScreenPatch keeps captures in separate windows above ordinary windows. There is no main window.
+[![Version](https://img.shields.io/badge/version-0.2.0-2563eb?style=flat-square)](https://github.com/Cougar74/ScreenPatch/blob/main/CHANGELOG.md)
+![Platform](https://img.shields.io/badge/platform-Windows-0078D4?style=flat-square&logo=windows)
+![Rust](https://img.shields.io/badge/built_with-Rust-CE412B?style=flat-square&logo=rust&logoColor=white)
+[![License](https://img.shields.io/badge/license-Apache--2.0-green?style=flat-square)](LICENSE)
 
-## Requirements
+[**Download for Windows**](https://github.com/Cougar74/ScreenPatch/blob/main/release/ScreenPatch.exe) · [Features](#-features) · [Getting started](#-getting-started) · [Roadmap](#-roadmap) · [🇷🇺 Русский](README.ru.md)
 
-Windows, and stable Rust with the MSVC toolchain. This repository does not pin a compiler version.
+</div>
 
-## Build
+---
 
-```
+> **A reference without the window switching.** Pin a code snippet, design, chart, or any screen detail while you keep working elsewhere.
+
+<!-- Add a real screenshot or demo GIF before enabling this image.
+![ScreenPatch in action](assets/screenpatch-demo.gif)
+-->
+
+## ✨ Features
+
+| | |
+|---|---|
+| 📌 **Floating captures** | Every capture lives in its own movable, resizable window above regular windows. No main window required. |
+| ✂️ **Region selection** | Press `Ctrl + Shift + S` and drag to capture an area. |
+| 🔄 **Refresh in place** | Press `R` to capture the original region again. |
+| 🔀 **Before / after** | Switch between the current and previous capture after refreshing. |
+| 📋 **Copy or save** | Copy the displayed image to the clipboard or save a full-resolution PNG. |
+| 🖥️ **Multi-monitor aware** | Keeps the image's physical pixel size when moving across displays with different scaling. |
+| 🌍 **English & Russian** | Automatic initial language selection, with a remembered manual override. |
+| 🔒 **Local-first** | No network requests initiated by ScreenPatch; captures stay on your computer. |
+
+## 🚀 Getting started
+
+**Windows:** [Download `ScreenPatch.exe`](https://github.com/Cougar74/ScreenPatch/blob/main/release/ScreenPatch.exe) from the repository and run it. ScreenPatch starts in the system tray—there is no main application window.
+
+1. Press **`Ctrl + Shift + S`** (or select **New capture** in the tray).
+2. **Drag** over the area you want to keep visible.
+3. **Move or resize** the floating image and continue your work.
+4. **Right-click** the image to reveal **Refresh · Before/after · Copy · Save · Close**.
+
+**Tip:** `R` refreshes the original region, `1` restores its original physical size, and `Esc` cancels region selection.
+
+## 💡 Made for your workflow
+
+- **Developers:** keep a specification, error message, or code example in view.
+- **Designers:** compare a reference with the UI you are building.
+- **QA engineers:** refresh a captured interface and switch between before and after.
+- **Everyone:** pin instructions, a chart, or a small piece of information without juggling windows.
+
+## ⌨️ Controls
+
+| Action | Control |
+|---|---|
+| New capture | `Ctrl + Shift + S` or tray menu |
+| Select region | Left-click and drag |
+| Cancel selection | `Esc` |
+| Move capture | Drag the image |
+| Resize capture | Drag its corner |
+| Show / hide controls | Right-click the image |
+| Refresh original region | `R` while the capture is active |
+| Restore original size | `1` while the capture is active |
+| Copy / Save / Close | Buttons revealed by right-click |
+| Show / hide / close all | Tray menu |
+
+Select **Help** from the tray for the in-app reference. The app remains in the tray when the last capture is closed; use **Exit** to quit.
+
+## 🛠️ Build from source
+
+Requires **Windows**, stable **Rust** and the **MSVC toolchain**.
+
+```powershell
+git clone https://github.com/Cougar74/ScreenPatch.git
+cd ScreenPatch
 cargo build --release
 ```
 
-The build writes `target/release/ScreenPatch.exe`. That path is not stored in git. The binary for this version is [release/ScreenPatch.exe](release/ScreenPatch.exe).
+The output is `target/release/ScreenPatch.exe`. During development, use `cargo run`.
 
-## Run
+## 🧭 Roadmap
 
-Start `release/ScreenPatch.exe`, or run `cargo run`. A tray icon appears and no window opens. Starting the program again exits immediately and does not add a second icon.
+Ideas being considered (not available in v0.2.0):
 
-## Language
+- [ ] **Customization:** opacity, lock position, configurable global hotkey
+- [ ] **Live references:** timed refresh, optional visual change highlights
+- [ ] **Workspace:** session restore, capture groups, layouts
+- [ ] **Better capture:** multi-monitor resilience and improved region selection
+- [ ] **Sharing:** quick annotations and privacy-aware redaction
 
-The first launch follows the Windows interface language. Russian Windows shows Russian labels. Any other language shows English. «Язык» or Language lists «Русский» and English, and the current one is checked. Choosing the other language switches at once and remembers the choice. Choosing the current language changes nothing. The next launch uses that choice instead of the Windows language.
+Have an idea? [Open an issue](https://github.com/Cougar74/ScreenPatch/issues). This list is exploratory, not a release commitment.
 
-## Capture
+## ⚠️ Current limitations
 
-Press Ctrl+Shift+S or choose «Новый снимок». Drag a region. A region smaller than 16×16 does not create a window. Esc closes only the selection.
+ScreenPatch v0.2.0 runs only on Windows and supports up to **10** open captures. It has a **512 MiB** combined frame budget and a **64 MiB** maximum per frame. It does not yet support automatic refresh, restored sessions, or captures anchored to another application's window. Changes in source-monitor geometry can prevent refresh until the original geometry returns.
 
-The new window matches the capture: one screen pixel per frame pixel. The buttons start hidden. Right-click shows them, and a second right-click hides them. The picture keeps its physical size. The buttons are round icons: refresh, before and after, copy, save, and close.
+See [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md) for the full list.
 
-Drag the picture to move the window. Drag the corner to resize it. The 120×80 minimum applies only to that corner. Press `1` to restore the original physical size and shift the window into the work area. Press `R` to capture the same region again. Moving the window onto a monitor with a different scale does not change the picture's physical size.
+## 🤝 Contributing
 
-## Windows
+Bug reports, usability suggestions and pull requests are welcome. Before larger changes, please [open an issue](https://github.com/Cougar74/ScreenPatch/issues) to discuss the approach. Review [ACCEPTANCE.md](ACCEPTANCE.md) for existing behavioral expectations and [CHANGELOG.md](CHANGELOG.md) for release history.
 
-«Показать все» and «Скрыть все» change visibility and leave the pictures unchanged. «Закрыть все снимки» asks for confirmation. «Справка» or Help opens one window that lists the hotkeys and mouse actions. Esc or the close button dismisses it. Choosing Help while that window is still open focuses it and does not move it. A separator sits above «Язык», and «Выход» stays below another separator. «Выход» leaves the tray and ends the process. Closing the last capture does not end the process. Show, hide, and close all leave the Help window as it is.
+## 📄 License
 
-## Privacy
+Licensed under [Apache License 2.0](LICENSE). Copyright © 2026 Eduard.
 
-The capture, the clipboard, and the PNG you choose stay on this computer. ScreenPatch does not make network requests of its own.
+---
 
-## Limitations
-
-See [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md).
-
-## License
-
-Apache License, Version 2.0. See [LICENSE](LICENSE).
-
-Copyright 2026 Eduard
+<div align="center"><sub>Built with 🦀 Rust. Keep your reference close, and your workspace clear.</sub></div>
