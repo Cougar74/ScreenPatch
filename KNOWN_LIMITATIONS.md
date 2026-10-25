@@ -1,6 +1,6 @@
 ﻿# Known limitations
 
-ScreenPatch 0.1.0 has these limits:
+ScreenPatch 0.2.0 has these limits:
 
 - Windows only.
 - At most 10 capture windows.
