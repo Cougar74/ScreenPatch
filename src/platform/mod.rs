@@ -2,6 +2,11 @@
 pub mod windows;
 
 #[cfg(windows)]
+mod port;
+
+#[cfg(windows)]
+pub use port::WindowsPlatform;
+#[cfg(windows)]
 pub use windows::{
     acquire_single_instance, capture_monitor_region, choose_png_path, confirm_close_all,
     cursor_screen_point, hwnd_from_window, list_displays, make_tooltip_click_through,

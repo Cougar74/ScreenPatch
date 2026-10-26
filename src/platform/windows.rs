@@ -345,10 +345,7 @@ pub fn read_saved_language() -> Result<Option<Language>, String> {
     };
     let path = PathBuf::from(root).join("ScreenPatch").join("language.txt");
     match std::fs::read_to_string(&path) {
-        Ok(text) if text.trim().is_empty() => Ok(None),
-        Ok(text) => language::parse_saved_language(&text)
-            .map(Some)
-            .ok_or_else(|| text.trim().to_string()),
+        Ok(text) => Ok(language::parse_saved_language(&text)),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(err) => Err(err.to_string()),
     }

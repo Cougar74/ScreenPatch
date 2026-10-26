@@ -313,6 +313,14 @@ pub const FRAME_TOO_BIG: Phrase = Phrase {
     ru: "размер кадра превышает 64 МиБ или переполняет расчёт буфера",
     en: "the frame is larger than 64 MiB or overflows the buffer calculation",
 };
+pub const SOURCE_UNSUPPORTED: Phrase = Phrase {
+    ru: "источник снимка не поддерживается",
+    en: "the capture source is not supported",
+};
+pub const CAPTURE_NOT_FOUND: Phrase = Phrase {
+    ru: "снимок {number} не найден",
+    en: "capture {number} was not found",
+};
 pub const MONITOR_NOT_FOUND: Phrase = Phrase {
     ru: "монитор {id} не найден",
     en: "monitor {id} was not found",

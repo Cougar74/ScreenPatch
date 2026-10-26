@@ -36,21 +36,19 @@ use screenpatch::core::geometry::{
     one_to_one_physical_size, place_window, shift_into_work_area, CaptureRect, LogicalRect,
     WorkArea, HELP_CLIENT_HEIGHT, HELP_CLIENT_WIDTH, help_window_origin, index_containing_point,
 };
-use screenpatch::core::patches::{
-    letterbox, AddPatchError, CommitRefreshError, PatchManager,
-};
-use screenpatch::core::refresh::{refresh_current, refresh_gate, ImageFrame, RefreshBlock};
+use screenpatch::core::model::{CaptureSource, ShownFrame};
+use screenpatch::core::patches::letterbox;
+use screenpatch::core::refresh::{Fingerprint, ImageFrame};
 use screenpatch::core::selection::{
     compose_overlay, crop_frame, normalize_drag, physical_cursor_point, selection_accepted,
     selection_ready, MonitorReadiness, SelectionAbort,
 };
+use screenpatch::core::session::{Outcome, Request, Session};
 use screenpatch::platform::{
-    acquire_single_instance, capture_monitor_region, choose_png_path, confirm_close_all,
-    cursor_screen_point, hwnd_from_window, list_displays, make_tooltip_click_through,
-    measure_tooltip_text, paint_help, paint_tooltip, place_tooltip_window, read_saved_language,
-    round_tooltip_window, suggested_png_name, system_ui_language, try_exclude_from_capture,
-    wait_until_hidden,
-    write_saved_language, DisplayInfo, Hwnd,
+    acquire_single_instance, choose_png_path, confirm_close_all, cursor_screen_point,
+    hwnd_from_window, list_displays, make_tooltip_click_through, measure_tooltip_text, paint_help,
+    paint_tooltip, place_tooltip_window, round_tooltip_window, suggested_png_name,
+    try_exclude_from_capture, DisplayInfo, Hwnd, WindowsPlatform,
 };
 
 struct PreparedOverlay {
@@ -87,15 +85,7 @@ struct PatchWindow {
     surface: softbuffer::Surface<Arc<Window>, Arc<Window>>,
     #[allow(dead_code)]
     context: softbuffer::Context<Arc<Window>>,
-    region: CaptureRect,
-    frame: ImageFrame,
     cursor: Option<(i32, i32)>,
-    fingerprint_id: String,
-    origin_x: i32,
-    origin_y: i32,
-    physical_width: u32,
-    physical_height: u32,
-    scale: f64,
     affinity: bool,
     refreshing: bool,
     strip_visible: bool,
@@ -141,7 +131,8 @@ struct App {
     prepared: Option<Vec<PreparedOverlay>>,
     overlays: Vec<OverlayWindow>,
     windows: Vec<PatchWindow>,
-    patches: PatchManager,
+    session: Session<WindowsPlatform>,
+    port: WindowsPlatform,
     drag: Option<Drag>,
     corner: Option<CornerResize>,
     started: bool,
@@ -169,18 +160,13 @@ fn main() {
 }
 
 fn run() -> Result<(), String> {
-    let language = match read_saved_language() {
-        Ok(Some(language)) => language,
-        Ok(None) => system_ui_language(),
-        Err(err) => {
-            let fallback = system_ui_language();
-            eprintln!(
-                "{}",
-                language::render(fallback, language::LANGUAGE_READ_FAILED, &[("err", &err)])
-            );
-            fallback
-        }
-    };
+    let mut port = WindowsPlatform::new(screenpatch::core::language::Language::En);
+    let (session, read_error) = Session::open(&port);
+    if let Some(message) = read_error {
+        eprintln!("{message}");
+    }
+    let language = session.language();
+    port.set_language(language);
     if !acquire_single_instance(language) {
         eprintln!("{}", language::text(language, language::ALREADY_RUNNING));
         return Ok(());
@@ -194,7 +180,8 @@ fn run() -> Result<(), String> {
         prepared: None,
         overlays: Vec::new(),
         windows: Vec::new(),
-        patches: PatchManager::new(),
+        session,
+        port,
         drag: None,
         corner: None,
         started: false,
@@ -235,6 +222,7 @@ fn enable_per_monitor_dpi() {
 fn prepare_overlays(
     language: Language,
     displays: &[DisplayInfo],
+    frames: &[(Fingerprint, Vec<u8>, u32, u32)],
 ) -> Result<Vec<PreparedOverlay>, String> {
     let mut readiness = Vec::new();
     let mut prepared = Vec::new();
@@ -244,25 +232,24 @@ fn prepare_overlays(
         let size_ok = display.physical_width > 0 && display.physical_height > 0;
         let mut frame_ready = false;
         if scale_ok && size_ok {
-            let region = CaptureRect {
-                x: 0,
-                y: 0,
-                width: display.physical_width,
-                height: display.physical_height,
-            };
-            match capture_monitor_region(language, &display.id, region) {
-                Ok(frame) => {
-                    frame_ready = true;
-                    prepared.push(PreparedOverlay {
-                        display: display.clone(),
-                        frame,
-                    });
-                }
-                Err(err) => {
-                    if capture_error.is_none() {
-                        capture_error = Some(err.message);
-                    }
-                }
+            let matched = frames.iter().find(|(monitor, pixels, width, height)| {
+                monitor.id == display.id
+                    && *width == display.physical_width
+                    && *height == display.physical_height
+                    && pixels.len() == (*width as usize).saturating_mul(*height as usize).saturating_mul(4)
+            });
+            if let Some((_, pixels, width, height)) = matched {
+                frame_ready = true;
+                prepared.push(PreparedOverlay {
+                    display: display.clone(),
+                    frame: ImageFrame {
+                        pixels: Arc::from(pixels.clone()),
+                        width: *width,
+                        height: *height,
+                    },
+                });
+            } else if capture_error.is_none() {
+                capture_error = Some(display.id.clone());
             }
         }
         readiness.push(MonitorReadiness {
@@ -403,8 +390,10 @@ impl ApplicationHandler for App {
                     self.end_corner_resize(index);
                 }
             }
+            WindowEvent::Moved(_) => self.note_window_moved(index),
             WindowEvent::Resized(_) => {
                 self.remember_physical_client(index);
+                self.note_window_moved(index);
                 self.windows[index].window.request_redraw();
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
@@ -670,9 +659,6 @@ impl App {
         region: CaptureRect,
         frame: ImageFrame,
     ) -> Result<(), String> {
-        self.patches
-            .check(&frame)
-            .map_err(|err| patch_add_error(self.language, &frame, err))?;
         let (region_w, region_h) =
             logical_window_size(frame.width, frame.height, display.scale)
                 .ok_or_else(|| self.fill(language::BAD_MONITOR_SCALE, &[("id", &display.id)]))?;
@@ -716,9 +702,23 @@ impl App {
             .map_err(|err| self.fill(language::WINDOW_SURFACE_FAILED, &[("err", &err.to_string())]))?;
         let hwnd = hwnd_from_window(&window).ok_or_else(|| self.say(language::NO_HWND).to_string())?;
         let affinity = try_exclude_from_capture(hwnd);
-        let number = match self.patches.add(region, frame.clone()) {
-            Ok(number) => number,
-            Err(err) => return Err(patch_add_error(self.language, &frame, err)),
+        let number = match self.session.handle(
+            &mut self.port,
+            Request::CaptureNew {
+                source: CaptureSource::Region {
+                    rect: region,
+                    fingerprint: display.fingerprint(),
+                },
+                x: position_x,
+                y: position_y,
+                width: physical_w,
+                height: physical_h,
+                pixels: frame.pixels.to_vec(),
+            },
+        ) {
+            Outcome::CaptureSucceeded { number } => number,
+            Outcome::CaptureFailed { message } => return Err(message),
+            _ => return Err(self.say(language::FRAME_TOO_BIG).to_string()),
         };
         window.set_title(&format!("ScreenPatch {number}"));
         let _ = window.request_inner_size(PhysicalSize::new(physical_w, physical_h));
@@ -729,15 +729,7 @@ impl App {
             window,
             context,
             surface,
-            region,
-            frame,
             cursor: None,
-            fingerprint_id: display.id.clone(),
-            origin_x: display.origin_x,
-            origin_y: display.origin_y,
-            physical_width: display.physical_width,
-            physical_height: display.physical_height,
-            scale: display.scale,
             affinity,
             refreshing: false,
             strip_visible: false,
@@ -773,163 +765,88 @@ impl App {
             eprintln!("{}", self.say(language::REFRESH_IN_PROGRESS));
             return;
         }
-        let monitor_id = self.windows[index].fingerprint_id.clone();
-        let region = self.windows[index].region;
-        let saved = screenpatch::core::refresh::Fingerprint {
-            id: monitor_id.clone(),
-            origin_x: self.windows[index].origin_x,
-            origin_y: self.windows[index].origin_y,
-            physical_width: self.windows[index].physical_width,
-            physical_height: self.windows[index].physical_height,
-            scale: self.windows[index].scale,
-        };
-        let displays = match list_displays(self.language) {
-            Ok(displays) => displays,
-            Err(err) => {
-                log_refresh_cancel(self.language, &monitor_id, region, &err.message);
-                return;
+        let number = self.windows[index].number;
+        let hide = self.capture_hide_list(!self.windows[index].affinity);
+        self.windows[index].refreshing = true;
+        let outcome = self.session.handle(
+            &mut self.port,
+            Request::CaptureRefresh { number, hide },
+        );
+        self.windows[index].refreshing = false;
+        self.reveal_tooltip_after_capture();
+        match outcome {
+            Outcome::CaptureSucceeded { .. } => {
+                self.windows[index].window.request_redraw();
             }
-        };
-        let monitors: Vec<screenpatch::core::refresh::Fingerprint> = displays
-            .iter()
-            .map(|display| display.fingerprint())
-            .collect();
-        match refresh_gate(&saved, &monitors) {
-            Ok(()) => {}
-            Err(RefreshBlock::MonitorMissing) => {
-                log_refresh_cancel(self.language, &monitor_id, region, self.say(language::MONITOR_MISSING));
-                return;
+            Outcome::CaptureFailed { message } | Outcome::SourceUnavailable { message } => {
+                eprintln!("{message}");
             }
-            Err(RefreshBlock::GeometryChanged) => {
-                log_refresh_cancel(self.language, &monitor_id, region, self.say(language::GEOMETRY_CHANGED));
-                return;
+            _ => {}
+        }
+    }
+
+    fn capture_hide_list(&mut self, hide_captures: bool) -> Vec<Hwnd> {
+        let mut hide = Vec::new();
+        if hide_captures {
+            for patch in &self.windows {
+                if patch.affinity || !patch.window.is_visible().unwrap_or(true) {
+                    continue;
+                }
+                if let Some(hwnd) = hwnd_from_window(&patch.window) {
+                    hide.push(hwnd);
+                }
             }
         }
-
-        let hide = !self.windows[index].affinity;
-        let mut hwnds: Vec<Hwnd> = self
-            .windows
-            .iter()
-            .filter_map(|patch| hwnd_from_window(&patch.window))
-            .collect();
-        let tooltip_hidden = self.conceal_tooltip_for_capture();
-        if tooltip_hidden {
+        if self.conceal_tooltip_for_capture() {
             if let Some(hwnd) = self
                 .tooltip
                 .as_ref()
                 .and_then(|tooltip| hwnd_from_window(&tooltip.window))
             {
-                hwnds.push(hwnd);
+                hide.push(hwnd);
             }
         }
-        let restore_windows: Vec<(Arc<Window>, bool)> = self
-            .windows
-            .iter()
-            .map(|patch| {
-                (
-                    Arc::clone(&patch.window),
-                    patch.window.is_visible().unwrap_or(true),
-                )
-            })
-            .collect();
-        if hide {
-            for (window, _) in &restore_windows {
-                window.set_visible(false);
-            }
-        }
-        self.windows[index].refreshing = true;
-        let current = self.windows[index].frame.clone();
-        let monitor_for_log = monitor_id.clone();
-        let mut captured = None;
-        let _ = refresh_current(
-            current,
-            true,
-            hide,
-            || {
-                if (hide || tooltip_hidden) && !hwnds.is_empty() && wait_until_hidden(&hwnds).is_err() {
-                    log_refresh_cancel(
-                        self.language,
-                        &monitor_for_log,
-                        region,
-                        self.say(language::HIDE_FAILED),
-                    );
-                    return Err(());
-                }
-                match capture_monitor_region(self.language, &monitor_for_log, region) {
-                    Ok(frame) => {
-                        captured = Some(frame.clone());
-                        Ok(frame)
-                    }
-                    Err(err) => {
-                        log_refresh_cancel(self.language, &monitor_for_log, region, &err.message);
-                        Err(())
-                    }
-                }
-            },
-            move || {
-                for (window, visible) in &restore_windows {
-                    window.set_visible(*visible);
-                }
-            },
-        );
-        self.windows[index].refreshing = false;
-        self.reveal_tooltip_after_capture();
-        let Some(frame) = captured else {
+        hide
+    }
+
+    fn shown_image(&self, number: u64) -> Option<ImageFrame> {
+        let capture = self.session.capture(number)?;
+        let frame = match capture.view.shown {
+            ShownFrame::Current => &capture.current,
+            ShownFrame::Previous => capture.previous.as_ref().unwrap_or(&capture.current),
+        };
+        Some(ImageFrame {
+            pixels: Arc::clone(&frame.pixels),
+            width: frame.width,
+            height: frame.height,
+        })
+    }
+
+    fn note_window_moved(&mut self, index: usize) {
+        let number = self.windows[index].number;
+        let Ok(position) = self.windows[index].window.outer_position() else {
             return;
         };
-        let number = self.windows[index].number;
-        match self.patches.commit_refresh(number, frame.clone()) {
-            Ok(()) => {
-                self.windows[index].frame = frame;
-                self.windows[index].window.request_redraw();
-            }
-            Err(CommitRefreshError::OverBudget {
-                frame_bytes,
-                used_bytes,
-            }) => {
-                eprintln!(
-                    "{}",
-                    self.fill(
-                        language::REFRESH_BUDGET,
-                        &[
-                            ("number", &number.to_string()),
-                            ("w", &frame.width.to_string()),
-                            ("h", &frame.height.to_string()),
-                            ("bytes", &frame_bytes.to_string()),
-                            ("used", &used_bytes.to_string()),
-                            ("id", &monitor_id),
-                        ],
-                    )
-                );
-            }
-            Err(CommitRefreshError::SizeMismatch) => {
-                eprintln!(
-                    "{}",
-                    self.fill(
-                        language::REFRESH_SIZE,
-                        &[
-                            ("number", &number.to_string()),
-                            ("w", &frame.width.to_string()),
-                            ("h", &frame.height.to_string()),
-                            ("rw", &region.width.to_string()),
-                            ("rh", &region.height.to_string()),
-                            ("id", &monitor_id),
-                        ],
-                    )
-                );
-            }
-        }
+        let size = self.windows[index].window.inner_size();
+        let _ = self.session.handle(
+            &mut self.port,
+            Request::WindowMoved {
+                number,
+                x: position.x,
+                y: position.y,
+                width: size.width,
+                height: size.height,
+            },
+        );
     }
 
     fn paint_patch(&mut self, index: usize) {
         let window = Arc::clone(&self.windows[index].window);
         let size = window.inner_size();
         let number = self.windows[index].number;
-        let shown = self
-            .patches
-            .shown_frame(number)
-            .cloned()
-            .unwrap_or_else(|| self.windows[index].frame.clone());
+        let Some(shown) = self.shown_image(number) else {
+            return;
+        };
         let scale = window.scale_factor();
         let mut frame = compose_patch(&shown, size.width, size.height);
         if self.windows[index].strip_visible {
@@ -957,11 +874,9 @@ impl App {
 
     fn restore_actual_size(&mut self, index: usize) {
         let number = self.windows[index].number;
-        let frame = self
-            .patches
-            .shown_frame(number)
-            .cloned()
-            .unwrap_or_else(|| self.windows[index].frame.clone());
+        let Some(frame) = self.shown_image(number) else {
+            return;
+        };
         let scale = self.windows[index].window.scale_factor();
         let Some((width, height)) =
             one_to_one_physical_size(frame.width, frame.height, scale)
@@ -1028,7 +943,7 @@ impl App {
         {
             self.clear_tooltip();
         }
-        self.patches.close(number);
+        self.session.handle(&mut self.port, Request::Close { number });
         self.windows.remove(index);
     }
 
@@ -1036,7 +951,7 @@ impl App {
         if !self.overlays.is_empty() {
             return;
         }
-        if self.patches.len() >= 10 {
+        if self.session.len() >= 10 {
             eprintln!("{}", self.say(language::WINDOW_LIMIT));
             return;
         }
@@ -1077,47 +992,18 @@ impl App {
     }
 
     fn capture_prepared(&mut self) -> Result<Vec<PreparedOverlay>, String> {
-        let hidden: Vec<(Arc<Window>, bool)> = self
-            .windows
-            .iter()
-            .filter(|patch| !patch.affinity)
-            .map(|patch| {
-                (
-                    Arc::clone(&patch.window),
-                    patch.window.is_visible().unwrap_or(true),
-                )
-            })
-            .collect();
-        let mut hwnds: Vec<Hwnd> = hidden
-            .iter()
-            .filter_map(|(window, _)| hwnd_from_window(window))
-            .collect();
-        if self.conceal_tooltip_for_capture() {
-            if let Some(hwnd) = self
-                .tooltip
-                .as_ref()
-                .and_then(|tooltip| hwnd_from_window(&tooltip.window))
-            {
-                hwnds.push(hwnd);
-            }
-        }
-        for (window, _) in &hidden {
-            window.set_visible(false);
-        }
-        let result = (|| {
-            if !hwnds.is_empty() && wait_until_hidden(&hwnds).is_err() {
-                return Err(self.say(language::HIDE_FAILED).to_string());
-            }
-            let displays = list_displays(self.language).map_err(|err| {
-                self.fill(language::MONITORS_NOT_FOUND, &[("err", &err.message)])
-            })?;
-            prepare_overlays(self.language, &displays)
-        })();
-        for (window, visible) in &hidden {
-            window.set_visible(*visible);
-        }
+        let hide = self.capture_hide_list(true);
+        let outcome = self.session.handle(&mut self.port, Request::Snapshot { hide });
         self.reveal_tooltip_after_capture();
-        result
+        let frames = match outcome {
+            Outcome::SnapshotSucceeded { monitors } => monitors,
+            Outcome::SnapshotFailed { message } => return Err(message),
+            _ => return Err(self.say(language::HIDE_FAILED).to_string()),
+        };
+        let displays = list_displays(self.language).map_err(|err| {
+            self.fill(language::MONITORS_NOT_FOUND, &[("err", &err.message)])
+        })?;
+        prepare_overlays(self.language, &displays, &frames)
     }
 
     fn begin_patch_pointer(&mut self, index: usize) {
@@ -1175,7 +1061,7 @@ impl App {
             Some(PanelAction::Refresh) => self.refresh(index),
             Some(PanelAction::BeforeAfter) => {
                 let number = self.windows[index].number;
-                let _ = self.patches.toggle_shown(number);
+                let _ = self.session.handle(&mut self.port, Request::ShownToggled { number });
                 self.windows[index].window.request_redraw();
             }
             Some(PanelAction::Copy) => self.copy_shown(index),
@@ -1312,11 +1198,14 @@ impl App {
             return;
         };
         self.language = next;
-        if let Err(err) = write_saved_language(self.language) {
-            eprintln!(
-                "{}",
-                self.fill(language::LANGUAGE_SAVE_FAILED, &[("err", &err)])
-            );
+        let outcome = self.session.handle(
+            &mut self.port,
+            Request::LanguageChosen { language: next },
+        );
+        self.language = self.session.language();
+        self.port.set_language(self.language);
+        if let Outcome::LanguageSaved { message: Some(message) } = outcome {
+            eprintln!("{message}");
         }
         if let Err(err) = self.replace_tray_menu() {
             eprintln!("{err}");
@@ -1870,7 +1759,6 @@ impl App {
         if !visible {
             self.clear_tooltip();
         }
-        self.patches.set_windows_visible(visible);
         for patch in &self.windows {
             patch.window.set_visible(visible);
         }
@@ -1886,16 +1774,22 @@ impl App {
         }
         self.clear_tooltip();
         self.corner = None;
+        self.forget_open_captures();
+    }
+
+    fn forget_open_captures(&mut self) {
+        let numbers: Vec<u64> = self.windows.iter().map(|patch| patch.number).collect();
         self.windows.clear();
-        self.patches.close_all(true);
+        for number in numbers {
+            let _ = self.session.handle(&mut self.port, Request::Close { number });
+        }
     }
 
     fn exit_app(&mut self, event_loop: &ActiveEventLoop) {
         self.drag = None;
         self.corner = None;
         self.overlays.clear();
-        self.windows.clear();
-        self.patches.close_all(true);
+        self.forget_open_captures();
         self.clear_tooltip();
         self.tooltip = None;
         self.help = None;
@@ -1903,33 +1797,15 @@ impl App {
         event_loop.exit();
     }
 
-    fn copy_shown(&self, index: usize) {
+    fn copy_shown(&mut self, index: usize) {
         let number = self.windows[index].number;
-        let Some(frame) = self.patches.shown_frame(number) else {
-            return;
-        };
-        let image = arboard::ImageData {
-            width: frame.width as usize,
-            height: frame.height as usize,
-            bytes: std::borrow::Cow::Borrowed(frame.pixels.as_ref()),
-        };
-        match arboard::Clipboard::new().and_then(|mut clipboard| clipboard.set_image(image)) {
-            Ok(()) => {}
-            Err(err) => eprintln!(
-                "{}",
-                self.fill(
-                    language::COPY_FAILED,
-                    &[("number", &number.to_string()), ("err", &err.to_string())],
-                )
-            ),
+        if let Outcome::CopyFailed { message } = self.session.handle(&mut self.port, Request::Copy { number }) {
+            eprintln!("{message}");
         }
     }
 
-    fn save_shown(&self, index: usize) {
+    fn save_shown(&mut self, index: usize) {
         let number = self.windows[index].number;
-        let Some(frame) = self.patches.shown_frame(number).cloned() else {
-            return;
-        };
         let parent = hwnd_from_window(&self.windows[index].window);
         let path = match choose_png_path(self.language, parent, &suggested_png_name()) {
             Ok(Some(path)) => path,
@@ -1939,14 +1815,11 @@ impl App {
                 return;
             }
         };
-        if let Err(err) = image::save_buffer(
-            &path,
-            frame.pixels.as_ref(),
-            frame.width,
-            frame.height,
-            image::ExtendedColorType::Rgba8,
-        ) {
-            eprintln!("{}", self.fill(language::SAVE_FAILED, &[("number", &number.to_string()), ("err", &err.to_string())]));
+        if let Outcome::SaveFailed { message } = self
+            .session
+            .handle(&mut self.port, Request::Save { number, path })
+        {
+            eprintln!("{message}");
         }
     }
 }
@@ -2132,25 +2005,6 @@ fn present_frame(
     let _ = buffer.present();
 }
 
-fn patch_add_error(language: Language, frame: &ImageFrame, err: AddPatchError) -> String {
-    match err {
-        AddPatchError::TooMany => language::text(language, language::TOO_MANY_SHORT).to_string(),
-        AddPatchError::OverBudget {
-            frame_bytes,
-            used_bytes,
-        } => language::render(
-            language,
-            language::FRAME_BUDGET,
-            &[
-                ("w", &frame.width.to_string()),
-                ("h", &frame.height.to_string()),
-                ("bytes", &frame_bytes.to_string()),
-                ("used", &used_bytes.to_string()),
-            ],
-        ),
-    }
-}
-
 fn absolute_work(display: &DisplayInfo) -> Option<(i32, i32, u32, u32)> {
     let x = display
         .origin_x
@@ -2294,24 +2148,6 @@ fn log_monitor(language: Language, display: &DisplayInfo, region: CaptureRect, a
                 ("rw", &region.width.to_string()),
                 ("rh", &region.height.to_string()),
                 ("excluded", exclusion),
-            ],
-        )
-    );
-}
-
-fn log_refresh_cancel(language: Language, monitor_id: &str, region: CaptureRect, reason: &str) {
-    eprintln!(
-        "{}",
-        language::render(
-            language,
-            language::REFRESH_CANCELLED,
-            &[
-                ("reason", reason),
-                ("id", monitor_id),
-                ("x", &region.x.to_string()),
-                ("y", &region.y.to_string()),
-                ("w", &region.width.to_string()),
-                ("h", &region.height.to_string()),
             ],
         )
     );

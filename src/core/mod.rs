@@ -1,7 +1,10 @@
 pub mod commands;
 pub mod geometry;
 pub mod language;
+pub mod model;
 pub mod patches;
+pub mod port;
 pub mod refresh;
 pub mod selection;
+pub mod session;
 pub mod tooltip;

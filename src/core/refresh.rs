@@ -9,7 +9,7 @@ pub struct ImageFrame {
     pub height: u32,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Fingerprint {
     pub id: String,
     pub origin_x: i32,
