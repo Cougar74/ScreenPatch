@@ -47,7 +47,7 @@ use screenpatch::core::session::{Outcome, Request, Session};
 use screenpatch::platform::{
     acquire_single_instance, choose_png_path, confirm_close_all, cursor_screen_point,
     hwnd_from_window, list_displays, make_tooltip_click_through, measure_tooltip_text, paint_help,
-    paint_tooltip, place_tooltip_window, round_tooltip_window, suggested_png_name,
+    paint_tooltip, place_tooltip_window,     round_tooltip_window, set_capture_excluded, suggested_png_name,
     try_exclude_from_capture, DisplayInfo, Hwnd, WindowsPlatform,
 };
 
@@ -87,6 +87,7 @@ struct PatchWindow {
     context: softbuffer::Context<Arc<Window>>,
     cursor: Option<(i32, i32)>,
     affinity: bool,
+    inclusive: bool,
     refreshing: bool,
     strip_visible: bool,
     strip_press: Option<PanelAction>,
@@ -149,6 +150,8 @@ struct App {
     tooltip_surface_logged: bool,
     hotkeys: Option<GlobalHotKeyManager>,
     hotkey_id: u32,
+    inclusive_hotkey_id: u32,
+    selection_inclusive: bool,
     language: Language,
 }
 
@@ -198,6 +201,8 @@ fn run() -> Result<(), String> {
         tooltip_surface_logged: false,
         hotkeys: None,
         hotkey_id: 0,
+        inclusive_hotkey_id: 0,
+        selection_inclusive: false,
         language,
     };
     event_loop.run_app(&mut app).map_err(|err| {
@@ -349,7 +354,7 @@ impl ApplicationHandler for App {
                     Key::Character(text) if text.eq_ignore_ascii_case("r") => self.refresh(index),
                     Key::Character(text) if text == "1" => self.restore_actual_size(index),
                     Key::Character(text) if text.eq_ignore_ascii_case("s") => {
-                        self.begin_selection(event_loop)
+                        self.begin_selection(event_loop, false)
                     }
                     _ => {}
                 }
@@ -731,6 +736,7 @@ impl App {
             surface,
             cursor: None,
             affinity,
+            inclusive: self.selection_inclusive,
             refreshing: false,
             strip_visible: false,
             strip_press: None,
@@ -766,13 +772,24 @@ impl App {
             return;
         }
         let number = self.windows[index].number;
-        let hide = self.capture_hide_list(!self.windows[index].affinity);
+        let inclusive = self.windows[index].inclusive;
+        let revealed = if inclusive {
+            self.reveal_for_inclusive(Some(index))
+        } else {
+            Vec::new()
+        };
+        let hide = if inclusive {
+            self.unexcluded_self(index)
+        } else {
+            self.capture_hide_list(!self.windows[index].affinity)
+        };
         self.windows[index].refreshing = true;
         let outcome = self.session.handle(
             &mut self.port,
             Request::CaptureRefresh { number, hide },
         );
         self.windows[index].refreshing = false;
+        self.restore_inclusion(revealed);
         self.reveal_tooltip_after_capture();
         match outcome {
             Outcome::CaptureSucceeded { .. } => {
@@ -947,7 +964,7 @@ impl App {
         self.windows.remove(index);
     }
 
-    fn begin_selection(&mut self, event_loop: &ActiveEventLoop) {
+    fn begin_selection(&mut self, event_loop: &ActiveEventLoop, inclusive: bool) {
         if !self.overlays.is_empty() {
             return;
         }
@@ -955,18 +972,21 @@ impl App {
             eprintln!("{}", self.say(language::WINDOW_LIMIT));
             return;
         }
-        self.clear_tooltip();
+        self.selection_inclusive = inclusive;
+        let revealed = if inclusive {
+            self.reveal_for_inclusive(None)
+        } else {
+            self.clear_tooltip();
+            Vec::new()
+        };
         let remembered: Vec<(Arc<Window>, bool)> = self
             .windows
             .iter()
-            .map(|patch| {
-                (
-                    Arc::clone(&patch.window),
-                    patch.window.is_visible().unwrap_or(true),
-                )
-            })
+            .map(|patch| (Arc::clone(&patch.window), patch.window.is_visible().unwrap_or(true)))
             .collect();
-        match self.capture_prepared() {
+        let prepared = self.capture_prepared(inclusive);
+        self.restore_inclusion(revealed);
+        match prepared {
             Ok(prepared) => {
                 self.prepared = Some(prepared);
                 if let Err(err) = self.open_overlays(event_loop) {
@@ -981,6 +1001,82 @@ impl App {
         }
     }
 
+    fn unexcluded_self(&self, index: usize) -> Vec<Hwnd> {
+        if self.windows[index].affinity || !self.windows[index].window.is_visible().unwrap_or(true) {
+            return Vec::new();
+        }
+        hwnd_from_window(&self.windows[index].window)
+            .into_iter()
+            .collect()
+    }
+
+    fn reveal_for_inclusive(&mut self, skip: Option<usize>) -> Vec<Inclusion> {
+        let mut revealed = Vec::new();
+        for index in 0..self.windows.len() {
+            if Some(index) == skip {
+                continue;
+            }
+            if !self.windows[index].affinity || !self.windows[index].window.is_visible().unwrap_or(true) {
+                continue;
+            }
+            let Some(hwnd) = hwnd_from_window(&self.windows[index].window) else {
+                continue;
+            };
+            let number = self.windows[index].number;
+            if set_capture_excluded(hwnd, false) {
+                revealed.push(Inclusion::Capture { index, hwnd, number });
+            } else {
+                eprintln!(
+                    "{}",
+                    self.fill(language::INCLUDE_CAPTURE_FAILED, &[("number", &number.to_string())])
+                );
+            }
+        }
+        let tooltip_open = self.tooltip.as_ref().is_some_and(|tooltip| {
+            tooltip.affinity && tooltip.window.is_visible().unwrap_or(true)
+        });
+        if tooltip_open {
+            if let Some(hwnd) = self
+                .tooltip
+                .as_ref()
+                .and_then(|tooltip| hwnd_from_window(&tooltip.window))
+            {
+                if set_capture_excluded(hwnd, false) {
+                    revealed.push(Inclusion::Tooltip { hwnd });
+                } else {
+                    eprintln!("{}", self.say(language::INCLUDE_TOOLTIP_FAILED));
+                }
+            }
+        }
+        revealed
+    }
+
+    fn restore_inclusion(&mut self, revealed: Vec<Inclusion>) {
+        for item in revealed {
+            match item {
+                Inclusion::Capture { index, hwnd, number } => {
+                    if !set_capture_excluded(hwnd, true) {
+                        if self.windows.get(index).is_some_and(|patch| patch.number == number) {
+                            self.windows[index].affinity = false;
+                        }
+                        eprintln!(
+                            "{}",
+                            self.fill(language::RESTORE_CAPTURE_FAILED, &[("number", &number.to_string())])
+                        );
+                    }
+                }
+                Inclusion::Tooltip { hwnd } => {
+                    if !set_capture_excluded(hwnd, true) {
+                        if let Some(tooltip) = &mut self.tooltip {
+                            tooltip.affinity = false;
+                        }
+                        eprintln!("{}", self.say(language::RESTORE_TOOLTIP_FAILED));
+                    }
+                }
+            }
+        }
+    }
+
     fn abort_selection(&mut self, remembered: &[(Arc<Window>, bool)]) {
         self.drag = None;
         self.prepared = None;
@@ -991,10 +1087,18 @@ impl App {
         self.reveal_tooltip_after_capture();
     }
 
-    fn capture_prepared(&mut self) -> Result<Vec<PreparedOverlay>, String> {
-        let hide = self.capture_hide_list(true);
+    fn capture_prepared(&mut self, inclusive: bool) -> Result<Vec<PreparedOverlay>, String> {
+        let hide = if inclusive {
+            Vec::new()
+        } else {
+            self.capture_hide_list(true)
+        };
         let outcome = self.session.handle(&mut self.port, Request::Snapshot { hide });
-        self.reveal_tooltip_after_capture();
+        if inclusive {
+            self.clear_tooltip();
+        } else {
+            self.reveal_tooltip_after_capture();
+        }
         let frames = match outcome {
             Outcome::SnapshotSucceeded { monitors } => monitors,
             Outcome::SnapshotFailed { message } => return Err(message),
@@ -1243,15 +1347,22 @@ impl App {
             .map_err(|err| self.fill(language::TRAY_CREATE_FAILED, &[("err", &err.to_string())]))?;
         self.tray_menus = Some(menus);
         self.tray = Some(tray);
-        match register_hotkey() {
-            Ok((manager, id)) => {
-                self.hotkeys = Some(manager);
-                self.hotkey_id = id;
+        match register_hotkeys() {
+            Ok(registered) => {
+                if let Some(err) = registered.capture_error {
+                    eprintln!("{}", self.fill(language::HOTKEY_BUSY, &[("err", &err)]));
+                }
+                if let Some(err) = registered.inclusive_error {
+                    eprintln!("{}", self.fill(language::HOTKEY_INCLUSIVE_BUSY, &[("err", &err)]));
+                }
+                self.hotkeys = Some(registered.manager);
+                self.hotkey_id = registered.capture_id.unwrap_or(0);
+                self.inclusive_hotkey_id = registered.inclusive_id.unwrap_or(0);
             }
-            Err(err) => eprintln!(
-                "{}",
-                self.fill(language::HOTKEY_BUSY, &[("err", &err)])
-            ),
+            Err(err) => {
+                eprintln!("{}", self.fill(language::HOTKEY_BUSY, &[("err", &err)]));
+                eprintln!("{}", self.fill(language::HOTKEY_INCLUSIVE_BUSY, &[("err", &err)]));
+            }
         }
         Ok(())
     }
@@ -1261,18 +1372,19 @@ impl App {
             self.menu_command(event_loop, &event.id);
         }
         while let Ok(event) = GlobalHotKeyEvent::receiver().try_recv() {
-            if self.hotkeys.is_some()
-                && event.state == HotKeyState::Pressed
-                && event.id == self.hotkey_id
-            {
-                self.begin_selection(event_loop);
+            if self.hotkeys.is_some() && event.state == HotKeyState::Pressed {
+                if self.hotkey_id != 0 && event.id == self.hotkey_id {
+                    self.begin_selection(event_loop, false);
+                } else if self.inclusive_hotkey_id != 0 && event.id == self.inclusive_hotkey_id {
+                    self.begin_selection(event_loop, true);
+                }
             }
         }
     }
 
     fn menu_command(&mut self, event_loop: &ActiveEventLoop, id: &MenuId) {
         if id == "new" {
-            self.begin_selection(event_loop);
+            self.begin_selection(event_loop, false);
         } else if id == "show" {
             self.set_patch_visibility(true);
         } else if id == "hide" {
@@ -1920,12 +2032,43 @@ fn apply_window_icon(language: Language, attributes: WindowAttributes) -> Window
     }
 }
 
-fn register_hotkey() -> Result<(GlobalHotKeyManager, u32), String> {
-    let hotkey = HotKey::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyS);
-    let id = hotkey.id();
+enum Inclusion {
+    Capture { index: usize, hwnd: Hwnd, number: u64 },
+    Tooltip { hwnd: Hwnd },
+}
+
+struct RegisteredHotkeys {
+    manager: GlobalHotKeyManager,
+    capture_id: Option<u32>,
+    inclusive_id: Option<u32>,
+    capture_error: Option<String>,
+    inclusive_error: Option<String>,
+}
+
+fn register_hotkeys() -> Result<RegisteredHotkeys, String> {
     let manager = GlobalHotKeyManager::new().map_err(|err| err.to_string())?;
-    manager.register(hotkey).map_err(|err| err.to_string())?;
-    Ok((manager, id))
+    let capture = HotKey::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyS);
+    let inclusive = HotKey::new(
+        Some(Modifiers::CONTROL | Modifiers::ALT | Modifiers::SHIFT),
+        Code::KeyS,
+    );
+    let capture_key = capture.id();
+    let inclusive_key = inclusive.id();
+    let (capture_id, capture_error) = match manager.register(capture) {
+        Ok(()) => (Some(capture_key), None),
+        Err(err) => (None, Some(err.to_string())),
+    };
+    let (inclusive_id, inclusive_error) = match manager.register(inclusive) {
+        Ok(()) => (Some(inclusive_key), None),
+        Err(err) => (None, Some(err.to_string())),
+    };
+    Ok(RegisteredHotkeys {
+        manager,
+        capture_id,
+        inclusive_id,
+        capture_error,
+        inclusive_error,
+    })
 }
 
 fn compose_patch(frame: &ImageFrame, width: u32, height: u32) -> ImageFrame {

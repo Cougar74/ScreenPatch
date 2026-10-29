@@ -119,8 +119,8 @@ pub fn place_window(
     farthest_corner(capture, window_width, window_height, work)
 }
 
-pub const HELP_CLIENT_WIDTH: u32 = 420;
-pub const HELP_CLIENT_HEIGHT: u32 = 376;
+pub const HELP_CLIENT_WIDTH: u32 = 560;
+pub const HELP_CLIENT_HEIGHT: u32 = 404;
 pub const HELP_PAD_X: i32 = 24;
 pub const HELP_PAD_Y: i32 = 20;
 pub const HELP_LINE_HEIGHT: i32 = 28;

@@ -33,9 +33,10 @@ pub fn parse_saved_language(text: &str) -> Option<Language> {
     }
 }
 
-const HELP_LINES_RU: [&str; 12] = [
+const HELP_LINES_RU: [&str; 13] = [
     "Горячие клавиши",
     "Ctrl+Shift+S — новый снимок",
+    "Ctrl+Alt+Shift+S — снимок с окнами программы",
     "  ",
     "В окне снимка",
     "R — обновить",
@@ -48,9 +49,10 @@ const HELP_LINES_RU: [&str; 12] = [
     "Перетаскивание — двигать окно",
 ];
 
-const HELP_LINES_EN: [&str; 12] = [
+const HELP_LINES_EN: [&str; 13] = [
     "Hotkeys",
     "Ctrl+Shift+S — new capture",
+    "Ctrl+Alt+Shift+S — capture with the app windows",
     "  ",
     "In a capture window",
     "R — refresh",
@@ -63,7 +65,7 @@ const HELP_LINES_EN: [&str; 12] = [
     "Drag — move the window",
 ];
 
-pub fn help_lines(language: Language) -> &'static [&'static str; 12] {
+pub fn help_lines(language: Language) -> &'static [&'static str; 13] {
     match language {
         Language::Ru => &HELP_LINES_RU,
         Language::En => &HELP_LINES_EN,
@@ -71,7 +73,7 @@ pub fn help_lines(language: Language) -> &'static [&'static str; 12] {
 }
 
 pub fn help_key(line: &str) -> Option<&str> {
-    for key in ["Ctrl+Shift+S", "Esc", "R", "S", "1"] {
+    for key in ["Ctrl+Alt+Shift+S", "Ctrl+Shift+S", "Esc", "R", "S", "1"] {
         if let Some(rest) = line.strip_prefix(key) {
             if rest.starts_with(" — ") {
                 return Some(key);
@@ -180,6 +182,26 @@ pub const SELECTION_FAILED: Phrase = Phrase {
 pub const HOTKEY_BUSY: Phrase = Phrase {
     ru: "сочетание Ctrl+Shift+S занято, новый снимок доступен из значка: {err}",
     en: "Ctrl+Shift+S is already taken, a new capture is available from the tray icon: {err}",
+};
+pub const HOTKEY_INCLUSIVE_BUSY: Phrase = Phrase {
+    ru: "сочетание Ctrl+Alt+Shift+S занято: {err}",
+    en: "Ctrl+Alt+Shift+S is already taken: {err}",
+};
+pub const INCLUDE_CAPTURE_FAILED: Phrase = Phrase {
+    ru: "не удалось включить снимок {number} в кадр",
+    en: "could not include capture {number} in the shot",
+};
+pub const INCLUDE_TOOLTIP_FAILED: Phrase = Phrase {
+    ru: "не удалось включить подсказку в кадр",
+    en: "could not include the tooltip in the shot",
+};
+pub const RESTORE_CAPTURE_FAILED: Phrase = Phrase {
+    ru: "не удалось снова исключить снимок {number}",
+    en: "could not exclude capture {number} again",
+};
+pub const RESTORE_TOOLTIP_FAILED: Phrase = Phrase {
+    ru: "не удалось снова исключить подсказку",
+    en: "could not exclude the tooltip again",
 };
 pub const REFRESH_CANCELLED: Phrase = Phrase {
     ru: "обновление отменено: {reason}, монитор id={id}, прямоугольник=({x},{y},{w}x{h})",

@@ -27,7 +27,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     MessageBoxW, MsgWaitForMultipleObjects, PeekMessageW, SWP_NOACTIVATE, SetWindowDisplayAffinity,
     SetWindowLongPtrW, SetWindowPos, TranslateMessage, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
     WS_EX_TRANSPARENT, IDYES, MB_ICONQUESTION, MB_YESNO, MSG, PM_REMOVE, QS_ALLINPUT,
-    WDA_EXCLUDEFROMCAPTURE,
+    WDA_EXCLUDEFROMCAPTURE, WDA_NONE,
 };
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use xcap::Monitor;
@@ -187,11 +187,18 @@ pub fn capture_monitor_region(
     frame_from_rgba(language, image.width(), image.height(), image.into_raw())
 }
 
-pub fn try_exclude_from_capture(hwnd: Hwnd) -> bool {
+pub fn set_capture_excluded(hwnd: Hwnd, excluded: bool) -> bool {
+    let affinity = if excluded {
+        WDA_EXCLUDEFROMCAPTURE
+    } else {
+        WDA_NONE
+    };
     let handle = HWND(hwnd.0 as *mut c_void);
-    unsafe {
-        SetWindowDisplayAffinity(handle, WDA_EXCLUDEFROMCAPTURE).is_ok()
-    }
+    unsafe { SetWindowDisplayAffinity(handle, affinity).is_ok() }
+}
+
+pub fn try_exclude_from_capture(hwnd: Hwnd) -> bool {
+    set_capture_excluded(hwnd, true)
 }
 
 pub fn wait_until_hidden(hwnds: &[Hwnd]) -> Result<(), ()> {
@@ -456,7 +463,7 @@ pub fn cursor_screen_point() -> Option<(i32, i32)> {
     Some((point.x, point.y))
 }
 
-pub fn paint_help(width: u32, height: u32, scale: f64, lines: &[&str; 12]) -> Vec<u8> {
+pub fn paint_help(width: u32, height: u32, scale: f64, lines: &[&str; 13]) -> Vec<u8> {
     let pixels = (width as usize).saturating_mul(height as usize).saturating_mul(4);
     let mut rgba = vec![32u8, 32, 32, 255].repeat(pixels / 4);
     if width == 0 || height == 0 {
@@ -613,7 +620,7 @@ unsafe fn draw_tooltip(rgba: &mut [u8], width: u32, height: u32, scale: f64, tex
     let _ = DeleteDC(dc);
 }
 
-unsafe fn draw_help_lines(rgba: &mut [u8], width: u32, height: u32, scale: f64, lines: &[&str; 12]) {
+unsafe fn draw_help_lines(rgba: &mut [u8], width: u32, height: u32, scale: f64, lines: &[&str; 13]) {
     let dc = CreateCompatibleDC(None);
     if dc.is_invalid() {
         return;

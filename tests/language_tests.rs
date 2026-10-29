@@ -40,6 +40,7 @@ fn help_lines_list_the_approved_hotkeys() {
         &[
             "Горячие клавиши",
             "Ctrl+Shift+S — новый снимок",
+            "Ctrl+Alt+Shift+S — снимок с окнами программы",
             "  ",
             "В окне снимка",
             "R — обновить",
@@ -57,6 +58,7 @@ fn help_lines_list_the_approved_hotkeys() {
         &[
             "Hotkeys",
             "Ctrl+Shift+S — new capture",
+            "Ctrl+Alt+Shift+S — capture with the app windows",
             "  ",
             "In a capture window",
             "R — refresh",
@@ -77,6 +79,10 @@ fn help_key_is_only_the_shortcut_before_the_dash() {
         help_key("Ctrl+Shift+S — новый снимок"),
         Some("Ctrl+Shift+S")
     );
+    assert_eq!(
+        help_key("Ctrl+Alt+Shift+S — снимок с окнами программы"),
+        Some("Ctrl+Alt+Shift+S")
+    );
     assert_eq!(help_key("R — обновить"), Some("R"));
     assert_eq!(help_key("1 — frame size"), Some("1"));
     assert_eq!(help_key("S — new capture"), Some("S"));
@@ -87,6 +93,54 @@ fn help_key_is_only_the_shortcut_before_the_dash() {
         None
     );
     assert_eq!(help_key("Drag — move the window"), None);
+}
+
+#[test]
+fn inclusive_capture_phrases_match_the_spec() {
+    use screenpatch::core::language::{
+        HOTKEY_INCLUSIVE_BUSY, INCLUDE_CAPTURE_FAILED, INCLUDE_TOOLTIP_FAILED,
+        RESTORE_CAPTURE_FAILED, RESTORE_TOOLTIP_FAILED,
+    };
+    assert_eq!(
+        text(Language::Ru, HOTKEY_INCLUSIVE_BUSY),
+        "сочетание Ctrl+Alt+Shift+S занято: {err}"
+    );
+    assert_eq!(
+        text(Language::En, HOTKEY_INCLUSIVE_BUSY),
+        "Ctrl+Alt+Shift+S is already taken: {err}"
+    );
+    assert_eq!(
+        text(Language::Ru, INCLUDE_CAPTURE_FAILED),
+        "не удалось включить снимок {number} в кадр"
+    );
+    assert_eq!(
+        text(Language::En, INCLUDE_CAPTURE_FAILED),
+        "could not include capture {number} in the shot"
+    );
+    assert_eq!(
+        text(Language::Ru, INCLUDE_TOOLTIP_FAILED),
+        "не удалось включить подсказку в кадр"
+    );
+    assert_eq!(
+        text(Language::En, INCLUDE_TOOLTIP_FAILED),
+        "could not include the tooltip in the shot"
+    );
+    assert_eq!(
+        text(Language::Ru, RESTORE_CAPTURE_FAILED),
+        "не удалось снова исключить снимок {number}"
+    );
+    assert_eq!(
+        text(Language::En, RESTORE_CAPTURE_FAILED),
+        "could not exclude capture {number} again"
+    );
+    assert_eq!(
+        text(Language::Ru, RESTORE_TOOLTIP_FAILED),
+        "не удалось снова исключить подсказку"
+    );
+    assert_eq!(
+        text(Language::En, RESTORE_TOOLTIP_FAILED),
+        "could not exclude the tooltip again"
+    );
 }
 
 #[test]

@@ -221,12 +221,12 @@ fn select_monitor_pair_returns_none_when_scales_match() {
 #[test]
 fn help_lines_fit_between_the_paddings() {
     assert_eq!(help_line_top(0), 20);
-    assert_eq!(help_line_top(11), 328);
+    assert_eq!(help_line_top(12), 356);
     assert_eq!(
-        help_line_top(11) + HELP_LINE_HEIGHT + HELP_PAD_Y,
+        help_line_top(12) + HELP_LINE_HEIGHT + HELP_PAD_Y,
         HELP_CLIENT_HEIGHT as i32
     );
-    assert_eq!(HELP_CLIENT_WIDTH as i32 - 2 * HELP_PAD_X, 372);
+    assert_eq!(HELP_CLIENT_WIDTH as i32 - 2 * HELP_PAD_X, 512);
 }
 
 #[test]
@@ -237,14 +237,14 @@ fn help_window_is_centered_on_the_work_area() {
         width: 1920,
         height: 1080,
     };
-    assert_eq!(help_window_origin(wide), (750, 352));
+    assert_eq!(help_window_origin(wide), (680, 338));
     let narrow = WorkArea {
         x: 10,
         y: 20,
         width: 100,
         height: 80,
     };
-    assert_eq!(help_window_origin(narrow), (-150, -128));
+    assert_eq!(help_window_origin(narrow), (-220, -142));
 }
 
 #[test]
