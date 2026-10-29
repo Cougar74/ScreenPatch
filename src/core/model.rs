@@ -33,6 +33,7 @@ pub struct CaptureView {
     pub width: u32,
     pub height: u32,
     pub opacity: u8,
+    pub locked: bool,
     pub shown: ShownFrame,
 }
 

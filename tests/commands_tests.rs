@@ -212,7 +212,7 @@ fn decode_button_icon_rejects_bytes_that_are_not_an_image() {
 
 #[test]
 fn button_icon_files_are_transparent_white_glyphs() {
-    for name in ["refresh.png", "before-after.png", "copy.png", "save.png", "close.png"] {
+    for name in ["refresh.png", "before-after.png", "copy.png", "save.png", "close.png", "lock-open.png", "lock-closed.png"] {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("src/icons")
             .join(name);
@@ -266,4 +266,34 @@ fn fade_changes_only_the_picture_alpha_until_premultiply() {
     premultiply_alpha(&mut pixels);
     assert_eq!(&pixels[0..4], &[24, 24, 24, 255]);
     assert_eq!(&pixels[4..8], &[20, 10, 5, 26]);
+}
+
+#[test]
+fn lock_sits_in_the_top_right_and_blocks_only_move_and_size() {
+    use screenpatch::core::commands::{draw_lock, gesture_allowed, lock_rect};
+    let rect = lock_rect(400, 300).expect("lock");
+    assert_eq!(
+        (rect.x, rect.y, rect.width, rect.height, rect.action),
+        (362, 8, 30, 30, PanelAction::Lock)
+    );
+    assert_eq!(client_hit(377, 23, 400, 300, true), PanelAction::Lock);
+    assert_eq!(client_hit(377, 23, 400, 300, false), PanelAction::Drag);
+    assert_eq!(client_hit(362, 8, 400, 300, true), PanelAction::Drag);
+    assert_eq!(client_hit(74, 23, 400, 300, true), PanelAction::Refresh);
+    assert_eq!(client_hit(390, 290, 400, 300, true), PanelAction::Resize);
+
+    assert!(!gesture_allowed(PanelAction::Drag, true));
+    assert!(!gesture_allowed(PanelAction::Resize, true));
+    assert!(gesture_allowed(PanelAction::Lock, true));
+    assert!(gesture_allowed(PanelAction::Slider, true));
+    assert!(gesture_allowed(PanelAction::Refresh, true));
+    assert!(gesture_allowed(PanelAction::Resize, false));
+    assert!(gesture_allowed(PanelAction::Drag, false));
+
+    let mut pixels = vec![0u8; 400 * 300 * 4];
+    draw_lock(&mut pixels, 400, 300, 1.0, false, false, &[None, None]);
+    assert_eq!(frame_pixel(&pixels, 400, 377, 23), [32, 32, 32, 255]);
+    assert_eq!(frame_pixel(&pixels, 400, 8, 8), [0, 0, 0, 0]);
+    draw_lock(&mut pixels, 400, 300, 1.0, true, true, &[None, None]);
+    assert_eq!(frame_pixel(&pixels, 400, 377, 23), [14, 14, 14, 255]);
 }

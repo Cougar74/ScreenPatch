@@ -5,6 +5,7 @@ pub enum PanelAction {
     Copy,
     Save,
     Close,
+    Lock,
     Slider,
     Drag,
     Resize,
@@ -74,6 +75,11 @@ pub fn client_hit(x: i32, y: i32, width: u32, height: u32, buttons_visible: bool
     if !buttons_visible {
         return PanelAction::Drag;
     }
+    if let Some(rect) = lock_rect(width, height) {
+        if point_in_rounded_rect(x, y, rect.x, rect.y, rect.width, rect.height, 15) {
+            return PanelAction::Lock;
+        }
+    }
     for rect in button_rects(width, height) {
         if point_in_rounded_rect(x, y, rect.x, rect.y, rect.width, rect.height, 8) {
             return rect.action;
@@ -112,6 +118,26 @@ pub fn slider_rect(width: u32, height: u32) -> Option<ButtonRect> {
         width: track_w as u32,
         height: SLIDER_HEIGHT as u32,
     })
+}
+
+pub fn lock_rect(width: u32, height: u32) -> Option<ButtonRect> {
+    let Ok(width_i) = i32::try_from(width) else {
+        return None;
+    };
+    if i32::try_from(height).is_err() || width == 0 || height == 0 {
+        return None;
+    }
+    Some(ButtonRect {
+        action: PanelAction::Lock,
+        x: width_i.saturating_sub(38),
+        y: 8,
+        width: 30,
+        height: 30,
+    })
+}
+
+pub fn gesture_allowed(action: PanelAction, locked: bool) -> bool {
+    !(locked && matches!(action, PanelAction::Drag | PanelAction::Resize))
 }
 
 pub fn opacity_from_slider(position: u32, track_width: u32) -> u8 {
@@ -298,7 +324,8 @@ pub fn strip_press_target(remembered: Option<PanelAction>, hit: PanelAction) -> 
             | PanelAction::BeforeAfter
             | PanelAction::Copy
             | PanelAction::Save
-            | PanelAction::Close),
+            | PanelAction::Close
+            | PanelAction::Lock),
         ) if hit == action => Some(action),
         _ => None,
     }
@@ -369,6 +396,70 @@ pub fn draw_buttons(
                     sample_icon(icon, x, y, icon_w, icon_h),
                 );
             }
+        }
+    }
+}
+
+pub fn draw_lock(
+    pixels: &mut [u8],
+    width: u32,
+    height: u32,
+    scale: f64,
+    pressed: bool,
+    locked: bool,
+    icons: &[Option<ButtonIcon>; 2],
+) {
+    use crate::core::geometry::{logical_client_keeping_physical, logical_to_physical_px};
+    let Some((logical_w, logical_h)) = logical_client_keeping_physical(width, height, scale) else {
+        return;
+    };
+    let Some(rect) = lock_rect(logical_w, logical_h) else {
+        return;
+    };
+    let scale_len = |logical: u32| -> u32 {
+        u32::try_from(
+            logical_to_physical_px(i32::try_from(logical).unwrap_or(i32::MAX), scale).unwrap_or(0),
+        )
+        .unwrap_or(0)
+    };
+    let scale_pos = |logical: i32| logical_to_physical_px(logical, scale).unwrap_or(0);
+    let left = scale_pos(rect.x);
+    let top = scale_pos(rect.y);
+    let button_w = scale_len(rect.width);
+    let button_h = scale_len(rect.height);
+    let radius = scale_len(15).max(1) as i32;
+    let fill = if pressed {
+        [14, 14, 14, 255]
+    } else {
+        [32, 32, 32, 255]
+    };
+    for y in top..top.saturating_add(button_h as i32) {
+        for x in left..left.saturating_add(button_w as i32) {
+            if point_in_rounded_rect(x, y, left, top, button_w, button_h, radius) {
+                blend_pixel(pixels, width, height, x, y, fill);
+            }
+        }
+    }
+    let Some(icon) = icons[usize::from(locked)].as_ref() else {
+        return;
+    };
+    if icon.width == 0 || icon.height == 0 {
+        return;
+    }
+    let icon_w = scale_len(16).max(1);
+    let icon_h = scale_len(16).max(1);
+    let icon_left = left + (button_w as i32 - icon_w as i32) / 2;
+    let icon_top = top + (button_h as i32 - icon_h as i32) / 2;
+    for y in 0..icon_h {
+        for x in 0..icon_w {
+            blend_pixel(
+                pixels,
+                width,
+                height,
+                icon_left + x as i32,
+                icon_top + y as i32,
+                sample_icon(icon, x, y, icon_w, icon_h),
+            );
         }
     }
 }

@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 use screenpatch::core::commands::PanelAction;
 use screenpatch::core::language::{text, Language};
 use screenpatch::core::tooltip::{
-    button_tip, note_hover, tooltip_client_size, tooltip_due, tooltip_origin,
+    action_tip, button_tip, lock_tip, note_hover, tooltip_client_size, tooltip_due, tooltip_origin,
 };
 
 #[test]
@@ -60,4 +60,17 @@ fn tooltip_origin_follows_the_cursor_and_stays_in_the_work_area() {
 #[test]
 fn tooltip_client_size_adds_padding_on_both_sides() {
     assert_eq!(tooltip_client_size(40, 16, 8, 4), (56, 24));
+}
+
+#[test]
+fn lock_tip_follows_the_flag_and_is_not_a_short_button_name() {
+    assert_eq!(button_tip(PanelAction::Lock), None);
+    assert_eq!(text(Language::Ru, lock_tip(false)), "Закрепить");
+    assert_eq!(text(Language::En, lock_tip(false)), "Pin");
+    assert_eq!(text(Language::Ru, lock_tip(true)), "Открепить");
+    assert_eq!(text(Language::En, lock_tip(true)), "Unpin");
+    assert_eq!(action_tip(PanelAction::Lock, false), Some(lock_tip(false)));
+    assert_eq!(action_tip(PanelAction::Lock, true), Some(lock_tip(true)));
+    assert_eq!(action_tip(PanelAction::Refresh, true), button_tip(PanelAction::Refresh));
+    assert_eq!(action_tip(PanelAction::Drag, false), None);
 }

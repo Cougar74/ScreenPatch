@@ -22,14 +22,15 @@ use windows::Win32::UI::HiDpi::{
 use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSMICON};
 
 use screenpatch::core::commands::{
-    client_hit, decode_button_icon, draw_buttons, draw_slider, fade_picture, opacity_from_slider,
-    premultiply_alpha, slider_rect, strip_press_target, ButtonIcon, PanelAction,
+    client_hit, decode_button_icon, draw_buttons, draw_lock, draw_slider, fade_picture,
+    gesture_allowed, opacity_from_slider, premultiply_alpha, slider_rect, strip_press_target,
+    ButtonIcon, PanelAction,
 };
 use screenpatch::core::language::{
     self, help_lines, language_choice, Language, LANGUAGE_NAME_EN, LANGUAGE_NAME_RU,
 };
 use screenpatch::core::tooltip::{
-    button_tip, note_hover, tooltip_client_size, tooltip_due, tooltip_origin, TooltipHover,
+    action_tip, note_hover, tooltip_client_size, tooltip_due, tooltip_origin, TooltipHover,
     TOOLTIP_DELAY,
 };
 use screenpatch::core::geometry::{
@@ -856,8 +857,24 @@ impl App {
         })
     }
 
+    fn capture_locked(&self, number: u64) -> bool {
+        self.session
+            .capture(number)
+            .is_some_and(|capture| capture.view.locked)
+    }
+
+    fn hover_locked(&self, window: WindowId) -> bool {
+        self.windows
+            .iter()
+            .find(|patch| patch.window.id() == window)
+            .is_some_and(|patch| self.capture_locked(patch.number))
+    }
+
     fn note_window_moved(&mut self, index: usize) {
         let number = self.windows[index].number;
+        if self.capture_locked(number) {
+            return;
+        }
         let Ok(position) = self.windows[index].window.outer_position() else {
             return;
         };
@@ -900,6 +917,15 @@ impl App {
                 scale,
                 self.strip_press_visual(index),
                 button_icons(self.language),
+            );
+            draw_lock(
+                &mut pixels,
+                frame.width,
+                frame.height,
+                scale,
+                self.strip_press_visual(index) == Some(PanelAction::Lock),
+                self.capture_locked(number),
+                lock_icons(self.language),
             );
             draw_slider(&mut pixels, frame.width, frame.height, scale, opacity);
         }
@@ -1185,7 +1211,11 @@ impl App {
         let Some((x, y)) = self.windows[index].cursor else {
             return;
         };
-        match client_hit(x, y, width, height, strip_visible) {
+        let hit = client_hit(x, y, width, height, strip_visible);
+        if !gesture_allowed(hit, self.capture_locked(self.windows[index].number)) {
+            return;
+        }
+        match hit {
             PanelAction::Resize => {
                 // Курсор не ограничиваем окном: иначе его нельзя вывести за край
                 // и окно получается только уменьшить.
@@ -1207,7 +1237,8 @@ impl App {
             | PanelAction::BeforeAfter
             | PanelAction::Copy
             | PanelAction::Save
-            |             PanelAction::Close) => {
+            | PanelAction::Close
+            | PanelAction::Lock) => {
                 self.windows[index].strip_press = Some(action);
                 window.request_redraw();
             }
@@ -1242,6 +1273,13 @@ impl App {
             }
             Some(PanelAction::Copy) => self.copy_shown(index),
             Some(PanelAction::Save) => self.save_shown(index),
+            Some(PanelAction::Lock) => {
+                let number = self.windows[index].number;
+                let _ = self.session.handle(&mut self.port, Request::LockToggled { number });
+                self.clear_tooltip();
+                self.capture_hover(Some(index));
+                self.windows[index].window.request_redraw();
+            }
             Some(PanelAction::Close) => {
                 self.close_patch(index);
                 return true;
@@ -1259,16 +1297,17 @@ impl App {
             .is_some_and(|corner| corner.window_id == window.id());
         let (width, height) = logical_client_size(window);
         let strip_visible = self.windows[index].strip_visible;
-        let icon = if resizing {
+        let locked = self.capture_locked(self.windows[index].number);
+        let hit = self
+            .windows[index]
+            .cursor
+            .map(|(x, y)| client_hit(x, y, width, height, strip_visible));
+        let icon = if resizing
+            || (hit == Some(PanelAction::Resize) && gesture_allowed(PanelAction::Resize, locked))
+        {
             CursorIcon::NwseResize
         } else {
-            match self.windows[index]
-                .cursor
-                .map(|(x, y)| client_hit(x, y, width, height, strip_visible))
-            {
-                Some(PanelAction::Resize) => CursorIcon::NwseResize,
-                _ => CursorIcon::Default,
-            }
+            CursorIcon::Default
         };
         window.set_cursor(icon);
     }
@@ -1658,9 +1697,10 @@ impl App {
         };
         let window_id = self.windows[index].window.id();
         let (width, height) = logical_client_size(&self.windows[index].window);
+        let locked = self.capture_locked(self.windows[index].number);
         let action = self.windows[index].cursor.and_then(|(x, y)| {
             let hit = client_hit(x, y, width, height, self.windows[index].strip_visible);
-            button_tip(hit).map(|_| hit)
+            action_tip(hit, locked).map(|_| hit)
         });
         let Some(action) = action else {
             self.tooltip_hover = None;
@@ -1712,7 +1752,7 @@ impl App {
         let hover = self.tooltip_hover?;
         let cursor = cursor_screen_point()?;
         let (scale, work) = self.tooltip_scale_and_work(cursor, hover.window)?;
-        let text = self.say(button_tip(hover.action)?);
+        let text = self.say(action_tip(hover.action, self.hover_locked(hover.window))?);
         let (text_width, text_height) = measure_tooltip_text(scale, text).unwrap_or_else(|| {
             let px = logical_to_physical_px(16, scale).unwrap_or(16);
             (px, px)
@@ -1924,7 +1964,7 @@ impl App {
         let size = window.inner_size();
         let text = self
             .tooltip_hover
-            .and_then(|hover| button_tip(hover.action))
+            .and_then(|hover| action_tip(hover.action, self.hover_locked(hover.window)))
             .map(|phrase| self.say(phrase))
             .unwrap_or("");
         let pixels = paint_tooltip(size.width, size.height, window.scale_factor(), text);
@@ -2180,6 +2220,30 @@ fn button_icons(language: Language) -> &'static [Option<ButtonIcon>; 5] {
             include_bytes!("icons/close.png"),
         ];
         std::array::from_fn(|index| match decode_button_icon(BUTTON_ICON_BYTES[index]) {
+            Some(icon) => Some(icon),
+            None => {
+                eprintln!(
+                    "{}",
+                    language::render(
+                        language,
+                        language::BUTTON_ICON_FAILED,
+                        &[("err", "invalid image")],
+                    )
+                );
+                None
+            }
+        })
+    })
+}
+
+fn lock_icons(language: Language) -> &'static [Option<ButtonIcon>; 2] {
+    static ICONS: OnceLock<[Option<ButtonIcon>; 2]> = OnceLock::new();
+    ICONS.get_or_init(|| {
+        const LOCK_ICON_BYTES: [&[u8]; 2] = [
+            include_bytes!("icons/lock-open.png"),
+            include_bytes!("icons/lock-closed.png"),
+        ];
+        std::array::from_fn(|index| match decode_button_icon(LOCK_ICON_BYTES[index]) {
             Some(icon) => Some(icon),
             None => {
                 eprintln!(

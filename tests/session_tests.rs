@@ -302,3 +302,49 @@ fn opacity_starts_at_255_and_does_not_follow_the_pixels() {
     session.handle(&mut fake, Request::ShownToggled { number: 1 });
     assert_eq!(session.capture(1).unwrap().view.opacity, 26);
 }
+
+#[test]
+fn lock_starts_open_and_survives_the_frame() {
+    let mut fake = fake_ru();
+    let mut session = open_ru(&fake);
+    let created = session.handle(&mut fake, capture_new(region(), pixels()));
+    assert!(matches!(created, Outcome::CaptureSucceeded { number: 1 }));
+    assert!(!session.capture(1).unwrap().view.locked);
+
+    let closed = session.handle(&mut fake, Request::LockToggled { number: 1 });
+    assert_eq!(closed, Outcome::ViewUpdated);
+    assert!(session.capture(1).unwrap().view.locked);
+
+    let unknown = session.handle(&mut fake, Request::LockToggled { number: 99 });
+    assert_eq!(unknown, Outcome::Ignored);
+    assert!(session.capture(1).unwrap().view.locked);
+
+    session.handle(
+        &mut fake,
+        Request::OpacitySet { number: 1, opacity: 40 },
+    );
+    fake.region_frame = fresh();
+    session.handle(&mut fake, Request::CaptureRefresh { number: 1, hide: vec![] });
+    session.handle(&mut fake, Request::Copy { number: 1 });
+    session.handle(
+        &mut fake,
+        Request::Save { number: 1, path: PathBuf::from("shot.png") },
+    );
+    session.handle(&mut fake, Request::ShownToggled { number: 1 });
+    session.handle(
+        &mut fake,
+        Request::WindowMoved { number: 1, x: 9, y: 8, width: 7, height: 6 },
+    );
+    let capture = session.capture(1).unwrap();
+    assert!(capture.view.locked);
+    assert_eq!(capture.view.opacity, 40);
+    assert_eq!(capture.view.x, 9);
+    assert_eq!(capture.view.y, 8);
+    assert_eq!(capture.view.width, 7);
+    assert_eq!(capture.view.height, 6);
+    assert_eq!(fake.copied.as_deref(), Some(fresh().as_slice()));
+
+    let opened = session.handle(&mut fake, Request::LockToggled { number: 1 });
+    assert_eq!(opened, Outcome::ViewUpdated);
+    assert!(!session.capture(1).unwrap().view.locked);
+}

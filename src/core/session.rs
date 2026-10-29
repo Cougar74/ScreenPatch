@@ -39,6 +39,7 @@ pub enum Request<W> {
     WindowMoved { number: u64, x: i32, y: i32, width: u32, height: u32 },
     ShownToggled { number: u64 },
     OpacitySet { number: u64, opacity: u8 },
+    LockToggled { number: u64 },
     Copy { number: u64 },
     Save { number: u64, path: PathBuf },
     Close { number: u64 },
@@ -156,6 +157,13 @@ impl<P: PlatformPort> Session<P> {
                 capture.view.opacity = opacity.max(MIN_CAPTURE_OPACITY);
                 Outcome::ViewUpdated
             }
+            Request::LockToggled { number } => {
+                let Some(capture) = self.captures.iter_mut().find(|capture| capture.number == number) else {
+                    return Outcome::Ignored;
+                };
+                capture.view.locked = !capture.view.locked;
+                Outcome::ViewUpdated
+            }
             Request::Copy { number } => {
                 let Some(frame) = self.shown(number) else {
                     return Outcome::CopyFailed { message: self.missing(number) };
@@ -252,6 +260,7 @@ impl<P: PlatformPort> Session<P> {
                 width,
                 height,
                 opacity: 255,
+                locked: false,
                 shown: ShownFrame::Current,
             },
         });

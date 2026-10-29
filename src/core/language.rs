@@ -33,7 +33,7 @@ pub fn parse_saved_language(text: &str) -> Option<Language> {
     }
 }
 
-const HELP_LINES_RU: [&str; 14] = [
+const HELP_LINES_RU: [&str; 15] = [
     "Горячие клавиши",
     "Ctrl+Shift+S — новый снимок",
     "Ctrl+Alt+Shift+S — снимок с окнами программы",
@@ -45,12 +45,13 @@ const HELP_LINES_RU: [&str; 14] = [
     "Esc — закрыть снимок",
     "  ",
     "Мышь",
-    "Правый клик — показать или скрыть кнопки и слайдер",
+    "Правый клик — показать или скрыть кнопки, слайдер и замок",
     "Перетаскивание — двигать окно",
+    "Замок — закрепить положение и размер",
     "Слайдер — прозрачность картинки",
 ];
 
-const HELP_LINES_EN: [&str; 14] = [
+const HELP_LINES_EN: [&str; 15] = [
     "Hotkeys",
     "Ctrl+Shift+S — new capture",
     "Ctrl+Alt+Shift+S — capture with the app windows",
@@ -62,12 +63,13 @@ const HELP_LINES_EN: [&str; 14] = [
     "Esc — close the capture",
     "  ",
     "Mouse",
-    "Right-click — show or hide the buttons and the slider",
+    "Right-click — show or hide the buttons, the slider, and the lock",
     "Drag — move the window",
+    "Lock — pin position and size",
     "Slider — picture opacity",
 ];
 
-pub fn help_lines(language: Language) -> &'static [&'static str; 14] {
+pub fn help_lines(language: Language) -> &'static [&'static str; 15] {
     match language {
         Language::Ru => &HELP_LINES_RU,
         Language::En => &HELP_LINES_EN,
@@ -107,6 +109,8 @@ pub const STRIP_BEFORE_AFTER: Phrase = Phrase { ru: "До/после", en: "Befo
 pub const STRIP_COPY: Phrase = Phrase { ru: "Копировать", en: "Copy" };
 pub const STRIP_SAVE: Phrase = Phrase { ru: "Сохранить", en: "Save" };
 pub const STRIP_CLOSE: Phrase = Phrase { ru: "Закрыть", en: "Close" };
+pub const STRIP_LOCK: Phrase = Phrase { ru: "Закрепить", en: "Pin" };
+pub const STRIP_UNLOCK: Phrase = Phrase { ru: "Открепить", en: "Unpin" };
 pub const BUTTON_ICON_FAILED: Phrase = Phrase {
     ru: "не удалось прочитать иконку кнопки: {err}",
     en: "could not read the button icon: {err}",

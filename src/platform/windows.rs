@@ -549,7 +549,7 @@ pub fn cursor_screen_point() -> Option<(i32, i32)> {
     Some((point.x, point.y))
 }
 
-pub fn paint_help(width: u32, height: u32, scale: f64, lines: &[&str; 14]) -> Vec<u8> {
+pub fn paint_help(width: u32, height: u32, scale: f64, lines: &[&str; 15]) -> Vec<u8> {
     let pixels = (width as usize).saturating_mul(height as usize).saturating_mul(4);
     let mut rgba = vec![32u8, 32, 32, 255].repeat(pixels / 4);
     if width == 0 || height == 0 {
@@ -706,7 +706,7 @@ unsafe fn draw_tooltip(rgba: &mut [u8], width: u32, height: u32, scale: f64, tex
     let _ = DeleteDC(dc);
 }
 
-unsafe fn draw_help_lines(rgba: &mut [u8], width: u32, height: u32, scale: f64, lines: &[&str; 14]) {
+unsafe fn draw_help_lines(rgba: &mut [u8], width: u32, height: u32, scale: f64, lines: &[&str; 15]) {
     let dc = CreateCompatibleDC(None);
     if dc.is_invalid() {
         return;

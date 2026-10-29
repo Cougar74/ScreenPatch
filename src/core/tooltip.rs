@@ -2,7 +2,7 @@ use std::time::{Duration, Instant};
 
 use crate::core::commands::PanelAction;
 use crate::core::language::{
-    Phrase, STRIP_BEFORE_AFTER, STRIP_CLOSE, STRIP_COPY, STRIP_REFRESH, STRIP_SAVE,
+    Phrase,     STRIP_BEFORE_AFTER, STRIP_CLOSE, STRIP_COPY, STRIP_LOCK, STRIP_REFRESH, STRIP_SAVE, STRIP_UNLOCK,
 };
 
 pub const TOOLTIP_DELAY: Duration = Duration::from_millis(200);
@@ -45,7 +45,22 @@ pub fn button_tip(action: PanelAction) -> Option<Phrase> {
         PanelAction::Copy => Some(STRIP_COPY),
         PanelAction::Save => Some(STRIP_SAVE),
         PanelAction::Close => Some(STRIP_CLOSE),
-        PanelAction::Slider | PanelAction::Drag | PanelAction::Resize => None,
+        PanelAction::Lock | PanelAction::Slider | PanelAction::Drag | PanelAction::Resize => None,
+    }
+}
+
+pub fn lock_tip(locked: bool) -> Phrase {
+    if locked {
+        STRIP_UNLOCK
+    } else {
+        STRIP_LOCK
+    }
+}
+
+pub fn action_tip(action: PanelAction, locked: bool) -> Option<Phrase> {
+    match action {
+        PanelAction::Lock => Some(lock_tip(locked)),
+        other => button_tip(other),
     }
 }
 
