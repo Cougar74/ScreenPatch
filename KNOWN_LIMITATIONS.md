@@ -1,6 +1,6 @@
 ﻿# Known limitations
 
-ScreenPatch 0.2.0 has these limits:
+ScreenPatch 0.3.0 has these limits:
 
 - Windows only.
 - At most 10 capture windows.
@@ -11,4 +11,5 @@ ScreenPatch 0.2.0 has these limits:
 - If the source monitor's geometry changes, `R` also keeps the old picture until that geometry returns.
 - If capture fails for any monitor, the whole new selection is cancelled.
 - If Ctrl+Shift+S is already taken, a new capture is still available from the tray.
+- If Ctrl+Alt+Shift+S is already taken, that gesture is unavailable. Ctrl+Shift+S and the tray still start a capture without the app windows.
 - This repository has no screenshots.

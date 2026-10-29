@@ -1,5 +1,13 @@
 ﻿# Changelog
 
+## 0.3.0
+
+The Windows binary is `release/ScreenPatch.exe`.
+
+- Hovering a capture button shows its name. The tip follows the cursor.
+- `Ctrl+Alt+Shift+S` captures a region and keeps visible ScreenPatch windows in the picture: other captures, Help, and a tooltip that is showing. Hidden captures stay out. `Ctrl+Shift+S`, the tray item, and `S` still leave the app's capture windows out.
+- Refreshing a capture made with `Ctrl+Alt+Shift+S` keeps those windows in the new picture. The window being refreshed is not part of that picture. Before/after still returns the previous frame.
+
 ## 0.2.0
 
 The Windows binary is `release/ScreenPatch.exe`.
