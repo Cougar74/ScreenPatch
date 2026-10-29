@@ -276,3 +276,29 @@ fn language_save_keeps_the_new_language_when_the_file_fails() {
     assert!(fake.saved_png.is_none());
     assert_eq!(fake.saved, Some(Language::Ru));
 }
+
+#[test]
+fn opacity_starts_at_255_and_does_not_follow_the_pixels() {
+    let mut fake = fake_ru();
+    let mut session = open_ru(&fake);
+    let created = session.handle(&mut fake, capture_new(region(), pixels()));
+    assert!(matches!(created, Outcome::CaptureSucceeded { number: 1 }));
+    assert_eq!(session.capture(1).unwrap().view.opacity, 255);
+
+    let lowered = session.handle(&mut fake, Request::OpacitySet { number: 1, opacity: 10 });
+    assert_eq!(lowered, Outcome::ViewUpdated);
+    assert_eq!(session.capture(1).unwrap().view.opacity, 26);
+
+    let unknown = session.handle(&mut fake, Request::OpacitySet { number: 99, opacity: 100 });
+    assert_eq!(unknown, Outcome::Ignored);
+
+    fake.region_frame = fresh();
+    session.handle(&mut fake, Request::CaptureRefresh { number: 1, hide: vec![] });
+    assert_eq!(session.capture(1).unwrap().view.opacity, 26);
+    session.handle(&mut fake, Request::Copy { number: 1 });
+    assert_eq!(fake.copied.as_deref(), Some(fresh().as_slice()));
+    session.handle(&mut fake, Request::Save { number: 1, path: PathBuf::from("shot.png") });
+    assert_eq!(fake.saved_png.as_deref(), Some(fresh().as_slice()));
+    session.handle(&mut fake, Request::ShownToggled { number: 1 });
+    assert_eq!(session.capture(1).unwrap().view.opacity, 26);
+}

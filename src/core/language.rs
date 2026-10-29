@@ -33,7 +33,7 @@ pub fn parse_saved_language(text: &str) -> Option<Language> {
     }
 }
 
-const HELP_LINES_RU: [&str; 13] = [
+const HELP_LINES_RU: [&str; 14] = [
     "Горячие клавиши",
     "Ctrl+Shift+S — новый снимок",
     "Ctrl+Alt+Shift+S — снимок с окнами программы",
@@ -45,11 +45,12 @@ const HELP_LINES_RU: [&str; 13] = [
     "Esc — закрыть снимок",
     "  ",
     "Мышь",
-    "Правый клик — показать или скрыть кнопки",
+    "Правый клик — показать или скрыть кнопки и слайдер",
     "Перетаскивание — двигать окно",
+    "Слайдер — прозрачность картинки",
 ];
 
-const HELP_LINES_EN: [&str; 13] = [
+const HELP_LINES_EN: [&str; 14] = [
     "Hotkeys",
     "Ctrl+Shift+S — new capture",
     "Ctrl+Alt+Shift+S — capture with the app windows",
@@ -61,11 +62,12 @@ const HELP_LINES_EN: [&str; 13] = [
     "Esc — close the capture",
     "  ",
     "Mouse",
-    "Right-click — show or hide the buttons",
+    "Right-click — show or hide the buttons and the slider",
     "Drag — move the window",
+    "Slider — picture opacity",
 ];
 
-pub fn help_lines(language: Language) -> &'static [&'static str; 13] {
+pub fn help_lines(language: Language) -> &'static [&'static str; 14] {
     match language {
         Language::Ru => &HELP_LINES_RU,
         Language::En => &HELP_LINES_EN,
@@ -186,6 +188,10 @@ pub const HOTKEY_BUSY: Phrase = Phrase {
 pub const HOTKEY_INCLUSIVE_BUSY: Phrase = Phrase {
     ru: "сочетание Ctrl+Alt+Shift+S занято: {err}",
     en: "Ctrl+Alt+Shift+S is already taken: {err}",
+};
+pub const SHOW_FAILED: Phrase = Phrase {
+    ru: "не удалось показать снимок {number}",
+    en: "could not show capture {number}",
 };
 pub const INCLUDE_CAPTURE_FAILED: Phrase = Phrase {
     ru: "не удалось включить снимок {number} в кадр",

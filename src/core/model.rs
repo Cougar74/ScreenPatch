@@ -36,6 +36,8 @@ pub struct CaptureView {
     pub shown: ShownFrame,
 }
 
+pub const MIN_CAPTURE_OPACITY: u8 = 26;
+
 pub struct CapturePolicy {
     pub max_captures: usize,
     pub byte_budget: usize,

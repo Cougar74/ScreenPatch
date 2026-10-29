@@ -4,6 +4,7 @@ use std::sync::Arc;
 use crate::core::language::{self, Language};
 use crate::core::model::{
     default_policy, frame_accepted, CaptureFrame, CapturePolicy, CaptureSource, CaptureView, ShownFrame,
+    MIN_CAPTURE_OPACITY,
 };
 use crate::core::port::PlatformPort;
 use crate::core::refresh::{refresh_gate, RefreshBlock};
@@ -37,6 +38,7 @@ pub enum Request<W> {
     CaptureRefresh { number: u64, hide: Vec<W> },
     WindowMoved { number: u64, x: i32, y: i32, width: u32, height: u32 },
     ShownToggled { number: u64 },
+    OpacitySet { number: u64, opacity: u8 },
     Copy { number: u64 },
     Save { number: u64, path: PathBuf },
     Close { number: u64 },
@@ -145,6 +147,13 @@ impl<P: PlatformPort> Session<P> {
                         ShownFrame::Previous => ShownFrame::Current,
                     };
                 }
+                Outcome::ViewUpdated
+            }
+            Request::OpacitySet { number, opacity } => {
+                let Some(capture) = self.captures.iter_mut().find(|capture| capture.number == number) else {
+                    return Outcome::Ignored;
+                };
+                capture.view.opacity = opacity.max(MIN_CAPTURE_OPACITY);
                 Outcome::ViewUpdated
             }
             Request::Copy { number } => {

@@ -10,11 +10,11 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::Graphics::Gdi::{
     CreateCompatibleDC, CreateDIBSection, CreateFontW, CreateRoundRectRgn, DeleteDC, DeleteObject, DrawTextW,
-    EnumDisplayMonitors, GetMonitorInfoW, GetTextExtentPoint32W, SelectObject, SetBkMode,
-    SetTextColor, SetWindowRgn, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS,
-    DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_TOP,
-    FF_DONTCARE, FW_BOLD, FW_NORMAL, OUT_DEFAULT_PRECIS, HDC, HFONT, HGDIOBJ, HMONITOR, MONITORINFO,
-    TRANSPARENT,
+    EnumDisplayMonitors, GetDC, GetMonitorInfoW, GetTextExtentPoint32W, ReleaseDC, SelectObject, SetBkMode,
+    SetTextColor, SetWindowRgn, AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION,
+    CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS, DT_LEFT,
+    DT_NOPREFIX, DT_SINGLELINE, DT_TOP, FF_DONTCARE, FW_BOLD, FW_NORMAL, OUT_DEFAULT_PRECIS, HDC, HFONT,
+    HGDIOBJ, HMONITOR, MONITORINFO, TRANSPARENT,
 };
 use windows::Win32::Globalization::GetUserDefaultUILanguage;
 use windows::Win32::System::SystemInformation::GetLocalTime;
@@ -25,9 +25,9 @@ use windows::Win32::UI::Controls::Dialogs::{
 use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetCursorPos, GetWindowLongPtrW, GWL_EXSTYLE, HWND_TOPMOST, IsWindowVisible,
     MessageBoxW, MsgWaitForMultipleObjects, PeekMessageW, SWP_NOACTIVATE, SetWindowDisplayAffinity,
-    SetWindowLongPtrW, SetWindowPos, TranslateMessage, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-    WS_EX_TRANSPARENT, IDYES, MB_ICONQUESTION, MB_YESNO, MSG, PM_REMOVE, QS_ALLINPUT,
-    WDA_EXCLUDEFROMCAPTURE, WDA_NONE,
+    SetWindowLongPtrW, SetWindowPos, TranslateMessage, ULW_ALPHA, UpdateLayeredWindow, WS_EX_LAYERED,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, IDYES, MB_ICONQUESTION, MB_YESNO, MSG,
+    PM_REMOVE, QS_ALLINPUT, WDA_EXCLUDEFROMCAPTURE, WDA_NONE,
 };
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use xcap::Monitor;
@@ -199,6 +199,92 @@ pub fn set_capture_excluded(hwnd: Hwnd, excluded: bool) -> bool {
 
 pub fn try_exclude_from_capture(hwnd: Hwnd) -> bool {
     set_capture_excluded(hwnd, true)
+}
+
+pub fn make_layered(hwnd: Hwnd) -> bool {
+    let handle = HWND(hwnd.0 as *mut c_void);
+    unsafe {
+        let style = GetWindowLongPtrW(handle, GWL_EXSTYLE);
+        let layered = (style & !(WS_EX_TRANSPARENT.0 as isize)) | (WS_EX_LAYERED.0 as isize);
+        SetWindowLongPtrW(handle, GWL_EXSTYLE, layered);
+    }
+    true
+}
+
+pub fn present_layered(hwnd: Hwnd, rgba: &[u8], width: u32, height: u32) -> bool {
+    let count = (width as usize).saturating_mul(height as usize).saturating_mul(4);
+    if width == 0 || height == 0 || rgba.len() != count {
+        return false;
+    }
+    let Ok(width_i) = i32::try_from(width) else {
+        return false;
+    };
+    let Ok(height_i) = i32::try_from(height) else {
+        return false;
+    };
+    unsafe {
+        let screen = GetDC(None);
+        if screen.is_invalid() {
+            return false;
+        }
+        let memory = CreateCompatibleDC(Some(screen));
+        if memory.is_invalid() {
+            let _ = ReleaseDC(None, screen);
+            return false;
+        }
+        let info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: width_i,
+                biHeight: -height_i,
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut bits: *mut c_void = std::ptr::null_mut();
+        let bitmap = CreateDIBSection(Some(memory), &info, DIB_RGB_COLORS, &mut bits, None, 0);
+        if bitmap.is_err() || bits.is_null() {
+            let _ = DeleteDC(memory);
+            let _ = ReleaseDC(None, screen);
+            return false;
+        }
+        let bitmap = bitmap.unwrap_or_default();
+        let bitmap_object = HGDIOBJ::from(bitmap);
+        let previous = SelectObject(memory, bitmap_object);
+        let dest = std::slice::from_raw_parts_mut(bits as *mut u8, count);
+        for (index, pixel) in dest.chunks_exact_mut(4).enumerate() {
+            let rgba = &rgba[index * 4..index * 4 + 4];
+            pixel.copy_from_slice(&[rgba[2], rgba[1], rgba[0], rgba[3]]);
+        }
+        let origin = POINT { x: 0, y: 0 };
+        let size = SIZE { cx: width_i, cy: height_i };
+        let blend = BLENDFUNCTION {
+            BlendOp: AC_SRC_OVER as u8,
+            BlendFlags: 0,
+            SourceConstantAlpha: 255,
+            AlphaFormat: AC_SRC_ALPHA as u8,
+        };
+        let ok = UpdateLayeredWindow(
+            HWND(hwnd.0 as *mut c_void),
+            Some(screen),
+            None,
+            Some(&size),
+            Some(memory),
+            Some(&origin),
+            COLORREF(0),
+            Some(&blend),
+            ULW_ALPHA,
+        )
+        .is_ok();
+        let _ = SelectObject(memory, previous);
+        let _ = DeleteObject(bitmap_object);
+        let _ = DeleteDC(memory);
+        let _ = ReleaseDC(None, screen);
+        ok
+    }
 }
 
 pub fn wait_until_hidden(hwnds: &[Hwnd]) -> Result<(), ()> {
@@ -463,7 +549,7 @@ pub fn cursor_screen_point() -> Option<(i32, i32)> {
     Some((point.x, point.y))
 }
 
-pub fn paint_help(width: u32, height: u32, scale: f64, lines: &[&str; 13]) -> Vec<u8> {
+pub fn paint_help(width: u32, height: u32, scale: f64, lines: &[&str; 14]) -> Vec<u8> {
     let pixels = (width as usize).saturating_mul(height as usize).saturating_mul(4);
     let mut rgba = vec![32u8, 32, 32, 255].repeat(pixels / 4);
     if width == 0 || height == 0 {
@@ -620,7 +706,7 @@ unsafe fn draw_tooltip(rgba: &mut [u8], width: u32, height: u32, scale: f64, tex
     let _ = DeleteDC(dc);
 }
 
-unsafe fn draw_help_lines(rgba: &mut [u8], width: u32, height: u32, scale: f64, lines: &[&str; 13]) {
+unsafe fn draw_help_lines(rgba: &mut [u8], width: u32, height: u32, scale: f64, lines: &[&str; 14]) {
     let dc = CreateCompatibleDC(None);
     if dc.is_invalid() {
         return;

@@ -5,6 +5,7 @@ pub enum PanelAction {
     Copy,
     Save,
     Close,
+    Slider,
     Drag,
     Resize,
 }
@@ -78,7 +79,179 @@ pub fn client_hit(x: i32, y: i32, width: u32, height: u32, buttons_visible: bool
             return rect.action;
         }
     }
+    if let Some(rect) = slider_rect(width, height) {
+        let right = rect.x.saturating_add(i32::try_from(rect.width).unwrap_or(0));
+        let bottom = rect.y.saturating_add(i32::try_from(rect.height).unwrap_or(0));
+        if x >= rect.x && y >= rect.y && x < right && y < bottom {
+            return PanelAction::Slider;
+        }
+    }
     PanelAction::Drag
+}
+
+const SLIDER_PAD_X: i32 = 24;
+const SLIDER_PAD_BOTTOM: i32 = 10;
+const SLIDER_HEIGHT: i32 = 22;
+
+pub fn slider_rect(width: u32, height: u32) -> Option<ButtonRect> {
+    let Ok(width_i) = i32::try_from(width) else {
+        return None;
+    };
+    let Ok(height_i) = i32::try_from(height) else {
+        return None;
+    };
+    let track_w = width_i.saturating_sub(SLIDER_PAD_X * 2);
+    let top = height_i - SLIDER_HEIGHT - SLIDER_PAD_BOTTOM;
+    if top < 0 || track_w < 1 {
+        return None;
+    }
+    Some(ButtonRect {
+        action: PanelAction::Slider,
+        x: SLIDER_PAD_X,
+        y: top,
+        width: track_w as u32,
+        height: SLIDER_HEIGHT as u32,
+    })
+}
+
+pub fn opacity_from_slider(position: u32, track_width: u32) -> u8 {
+    if track_width == 0 {
+        return crate::core::model::MIN_CAPTURE_OPACITY;
+    }
+    let position = u64::from(position.min(track_width));
+    let value = 26 + position * 229 / u64::from(track_width);
+    u8::try_from(value).unwrap_or(255)
+}
+
+pub fn slider_fill_width(opacity: u8, track_width: u32) -> u32 {
+    let opacity = u32::from(opacity.max(crate::core::model::MIN_CAPTURE_OPACITY));
+    let above = opacity.saturating_sub(26);
+    ((u64::from(above) * u64::from(track_width)) / 229) as u32
+}
+
+pub fn fade_picture(
+    pixels: &mut [u8],
+    width: u32,
+    height: u32,
+    picture: crate::core::patches::Letterbox,
+    opacity: u8,
+) {
+    let opacity = opacity.max(crate::core::model::MIN_CAPTURE_OPACITY);
+    for y in picture.y..picture.y.saturating_add(picture.height).min(height) {
+        for x in picture.x..picture.x.saturating_add(picture.width).min(width) {
+            let index = ((y * width + x) * 4) as usize;
+            if index + 3 < pixels.len() {
+                pixels[index + 3] = opacity;
+            }
+        }
+    }
+}
+
+pub fn premultiply_alpha(pixels: &mut [u8]) {
+    for pixel in pixels.chunks_exact_mut(4) {
+        let alpha = u32::from(pixel[3]);
+        for channel in 0..3 {
+            pixel[channel] = ((u32::from(pixel[channel]) * alpha) / 255) as u8;
+        }
+    }
+}
+
+pub fn draw_slider(pixels: &mut [u8], width: u32, height: u32, scale: f64, opacity: u8) {
+    use crate::core::geometry::{logical_client_keeping_physical, logical_to_physical_px};
+    let Some((logical_w, logical_h)) = logical_client_keeping_physical(width, height, scale) else {
+        return;
+    };
+    let Some(rect) = slider_rect(logical_w, logical_h) else {
+        return;
+    };
+    let scale_len = |logical: u32| -> u32 {
+        u32::try_from(
+            logical_to_physical_px(i32::try_from(logical).unwrap_or(i32::MAX), scale).unwrap_or(0),
+        )
+        .unwrap_or(0)
+    };
+    let scale_pos = |logical: i32| logical_to_physical_px(logical, scale).unwrap_or(0);
+    let thumb = 16u32;
+    let track_h = 6u32;
+    let inner = rect.width.saturating_sub(thumb);
+    let travel = slider_fill_width(opacity, inner);
+    let track_left = scale_pos(rect.x);
+    let track_top = scale_pos(rect.y + (SLIDER_HEIGHT - track_h as i32) / 2);
+    let track_w = scale_len(rect.width);
+    let track_px = scale_len(track_h).max(2);
+    let radius = (track_px / 2) as i32;
+    fill_round_rect(
+        pixels,
+        width,
+        height,
+        track_left,
+        track_top,
+        track_w,
+        track_px,
+        radius,
+        [48, 48, 48, 255],
+    );
+    let fill_logical = travel.saturating_add(thumb / 2).min(rect.width);
+    if fill_logical >= track_h {
+        fill_round_rect(
+            pixels,
+            width,
+            height,
+            track_left,
+            track_top,
+            scale_len(fill_logical).max(track_px),
+            track_px,
+            radius,
+            [214, 214, 214, 255],
+        );
+    }
+    let thumb_px = scale_len(thumb).max(4);
+    let thumb_left = scale_pos(rect.x + travel as i32);
+    let thumb_top = scale_pos(rect.y + (SLIDER_HEIGHT - thumb as i32) / 2);
+    fill_round_rect(
+        pixels,
+        width,
+        height,
+        thumb_left,
+        thumb_top,
+        thumb_px,
+        thumb_px,
+        (thumb_px / 2) as i32,
+        [24, 24, 24, 255],
+    );
+    let face = thumb_px.saturating_sub(scale_len(4).max(2));
+    let inset = ((thumb_px - face) / 2) as i32;
+    fill_round_rect(
+        pixels,
+        width,
+        height,
+        thumb_left + inset,
+        thumb_top + inset,
+        face,
+        face,
+        (face / 2) as i32,
+        [255, 255, 255, 255],
+    );
+}
+
+fn fill_round_rect(
+    pixels: &mut [u8],
+    width: u32,
+    height: u32,
+    left: i32,
+    top: i32,
+    rect_w: u32,
+    rect_h: u32,
+    radius: i32,
+    color: [u8; 4],
+) {
+    for y in top..top.saturating_add(rect_h as i32) {
+        for x in left..left.saturating_add(rect_w as i32) {
+            if point_in_rounded_rect(x, y, left, top, rect_w, rect_h, radius) {
+                blend_pixel(pixels, width, height, x, y, color);
+            }
+        }
+    }
 }
 
 pub fn point_in_rounded_rect(
@@ -164,9 +337,9 @@ pub fn draw_buttons(
         let button_w = scale_len(rect.width);
         let button_h = scale_len(rect.height);
         let fill = if pressed == Some(rect.action) {
-            [14, 14, 14, 220]
+            [14, 14, 14, 255]
         } else {
-            [32, 32, 32, 170]
+            [32, 32, 32, 255]
         };
         for y in top..top.saturating_add(button_h as i32) {
             for x in left..left.saturating_add(button_w as i32) {

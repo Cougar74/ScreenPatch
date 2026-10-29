@@ -49,8 +49,9 @@ fn help_lines_list_the_approved_hotkeys() {
             "Esc — закрыть снимок",
             "  ",
             "Мышь",
-            "Правый клик — показать или скрыть кнопки",
+            "Правый клик — показать или скрыть кнопки и слайдер",
             "Перетаскивание — двигать окно",
+            "Слайдер — прозрачность картинки",
         ]
     );
     assert_eq!(
@@ -67,8 +68,9 @@ fn help_lines_list_the_approved_hotkeys() {
             "Esc — close the capture",
             "  ",
             "Mouse",
-            "Right-click — show or hide the buttons",
+            "Right-click — show or hide the buttons and the slider",
             "Drag — move the window",
+            "Slider — picture opacity",
         ]
     );
 }
@@ -89,10 +91,23 @@ fn help_key_is_only_the_shortcut_before_the_dash() {
     assert_eq!(help_key("Esc — закрыть снимок"), Some("Esc"));
     assert_eq!(help_key("Мышь"), None);
     assert_eq!(
-        help_key("Правый клик — показать или скрыть кнопки"),
+        help_key("Правый клик — показать или скрыть кнопки и слайдер"),
         None
     );
     assert_eq!(help_key("Drag — move the window"), None);
+}
+
+#[test]
+fn show_failed_phrase_matches_the_spec() {
+    use screenpatch::core::language::SHOW_FAILED;
+    assert_eq!(text(Language::Ru, SHOW_FAILED), "не удалось показать снимок {number}");
+    assert_eq!(text(Language::En, SHOW_FAILED), "could not show capture {number}");
+    assert_eq!(help_key("Слайдер — прозрачность картинки"), None);
+    assert_eq!(help_key("Slider — picture opacity"), None);
+    assert_eq!(
+        help_key("Правый клик — показать или скрыть кнопки и слайдер"),
+        None
+    );
 }
 
 #[test]

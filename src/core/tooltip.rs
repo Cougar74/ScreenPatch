@@ -45,7 +45,7 @@ pub fn button_tip(action: PanelAction) -> Option<Phrase> {
         PanelAction::Copy => Some(STRIP_COPY),
         PanelAction::Save => Some(STRIP_SAVE),
         PanelAction::Close => Some(STRIP_CLOSE),
-        PanelAction::Drag | PanelAction::Resize => None,
+        PanelAction::Slider | PanelAction::Drag | PanelAction::Resize => None,
     }
 }
 

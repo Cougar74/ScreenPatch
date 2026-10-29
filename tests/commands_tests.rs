@@ -190,16 +190,16 @@ fn buttons_blend_over_the_screenshot_and_a_missing_icon_stays_gray() {
     let background = [10, 20, 30, 255];
     assert_eq!(
         frame_pixel(&pixels, 400, 90, 10),
-        blend(background, [32, 32, 32, 170])
+        blend(background, [32, 32, 32, 255])
     );
     assert_eq!(
         frame_pixel(&pixels, 400, 148, 10),
-        blend(background, [14, 14, 14, 220])
+        blend(background, [14, 14, 14, 255])
     );
     assert_eq!(frame_pixel(&pixels, 400, 96, 23), [255, 255, 255, 255]);
     assert_eq!(
         frame_pixel(&pixels, 400, 200, 23),
-        blend(background, [32, 32, 32, 170])
+        blend(background, [32, 32, 32, 255])
     );
     assert_eq!(frame_pixel(&pixels, 400, 0, 0), background);
 }
@@ -229,4 +229,41 @@ fn button_icon_files_are_transparent_white_glyphs() {
             .chunks_exact(4)
             .any(|pixel| pixel[3] > 0 && pixel[3] < 255));
     }
+}
+
+#[test]
+fn slider_sits_on_the_bottom_and_maps_the_ends() {
+    use screenpatch::core::commands::{opacity_from_slider, slider_fill_width, slider_rect};
+    let rect = slider_rect(400, 300).expect("track");
+    assert_eq!((rect.x, rect.y, rect.width, rect.height), (24, 268, 352, 22));
+    assert!(slider_rect(20, 300).is_none());
+    assert_eq!(opacity_from_slider(0, 352), 26);
+    assert_eq!(opacity_from_slider(352, 352), 255);
+    assert_eq!(opacity_from_slider(176, 352), 140);
+    assert_eq!(slider_fill_width(26, 352), 0);
+    assert_eq!(slider_fill_width(255, 352), 352);
+    assert_eq!(client_hit(24, 278, 400, 300, true), PanelAction::Slider);
+    assert_eq!(client_hit(375, 278, 400, 300, true), PanelAction::Slider);
+    assert_eq!(client_hit(390, 290, 400, 300, true), PanelAction::Resize);
+    assert_eq!(client_hit(24, 278, 400, 300, false), PanelAction::Drag);
+    assert_eq!(client_hit(96, 23, 400, 300, true), PanelAction::Refresh);
+}
+
+#[test]
+fn fade_changes_only_the_picture_alpha_until_premultiply() {
+    use screenpatch::core::commands::{fade_picture, premultiply_alpha};
+    use screenpatch::core::patches::Letterbox;
+    let mut pixels = vec![24, 24, 24, 255, 200, 100, 50, 255];
+    fade_picture(
+        &mut pixels,
+        2,
+        1,
+        Letterbox { x: 1, y: 0, width: 1, height: 1 },
+        26,
+    );
+    assert_eq!(&pixels[0..4], &[24, 24, 24, 255]);
+    assert_eq!(&pixels[4..8], &[200, 100, 50, 26]);
+    premultiply_alpha(&mut pixels);
+    assert_eq!(&pixels[0..4], &[24, 24, 24, 255]);
+    assert_eq!(&pixels[4..8], &[20, 10, 5, 26]);
 }

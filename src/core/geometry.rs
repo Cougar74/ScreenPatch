@@ -120,7 +120,7 @@ pub fn place_window(
 }
 
 pub const HELP_CLIENT_WIDTH: u32 = 560;
-pub const HELP_CLIENT_HEIGHT: u32 = 404;
+pub const HELP_CLIENT_HEIGHT: u32 = 432;
 pub const HELP_PAD_X: i32 = 24;
 pub const HELP_PAD_Y: i32 = 20;
 pub const HELP_LINE_HEIGHT: i32 = 28;

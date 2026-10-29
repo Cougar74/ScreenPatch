@@ -22,7 +22,8 @@ use windows::Win32::UI::HiDpi::{
 use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSMICON};
 
 use screenpatch::core::commands::{
-    client_hit, decode_button_icon, draw_buttons, strip_press_target, ButtonIcon, PanelAction,
+    client_hit, decode_button_icon, draw_buttons, draw_slider, fade_picture, opacity_from_slider,
+    premultiply_alpha, slider_rect, strip_press_target, ButtonIcon, PanelAction,
 };
 use screenpatch::core::language::{
     self, help_lines, language_choice, Language, LANGUAGE_NAME_EN, LANGUAGE_NAME_RU,
@@ -46,9 +47,10 @@ use screenpatch::core::selection::{
 use screenpatch::core::session::{Outcome, Request, Session};
 use screenpatch::platform::{
     acquire_single_instance, choose_png_path, confirm_close_all, cursor_screen_point,
-    hwnd_from_window, list_displays, make_tooltip_click_through, measure_tooltip_text, paint_help,
-    paint_tooltip, place_tooltip_window,     round_tooltip_window, set_capture_excluded, suggested_png_name,
-    try_exclude_from_capture, DisplayInfo, Hwnd, WindowsPlatform,
+    hwnd_from_window, list_displays, make_layered, make_tooltip_click_through, measure_tooltip_text,
+    paint_help, paint_tooltip, place_tooltip_window, present_layered, round_tooltip_window,
+    set_capture_excluded, suggested_png_name, try_exclude_from_capture, DisplayInfo, Hwnd,
+    WindowsPlatform,
 };
 
 struct PreparedOverlay {
@@ -82,6 +84,7 @@ struct CornerResize {
 struct PatchWindow {
     number: u64,
     window: Arc<Window>,
+    #[allow(dead_code)]
     surface: softbuffer::Surface<Arc<Window>, Arc<Window>>,
     #[allow(dead_code)]
     context: softbuffer::Context<Arc<Window>>,
@@ -91,6 +94,7 @@ struct PatchWindow {
     refreshing: bool,
     strip_visible: bool,
     strip_press: Option<PanelAction>,
+    present_fault_logged: bool,
     physical_client: (u32, u32),
 }
 
@@ -152,6 +156,7 @@ struct App {
     hotkey_id: u32,
     inclusive_hotkey_id: u32,
     selection_inclusive: bool,
+    slider_drag: Option<WindowId>,
     language: Language,
 }
 
@@ -203,6 +208,7 @@ fn run() -> Result<(), String> {
         hotkey_id: 0,
         inclusive_hotkey_id: 0,
         selection_inclusive: false,
+        slider_drag: None,
         language,
     };
     event_loop.run_app(&mut app).map_err(|err| {
@@ -362,15 +368,21 @@ impl ApplicationHandler for App {
             WindowEvent::CursorMoved { position, .. } => {
                 let scale = self.windows[index].window.scale_factor();
                 self.windows[index].cursor = logical_client_point(position.x, position.y, scale);
+                let dragging = self.slider_drag == Some(self.windows[index].window.id());
                 self.update_patch_cursor(index);
                 self.apply_corner_resize(index);
-                if self.windows[index].strip_press.is_some() {
+                if dragging {
+                    self.set_opacity_from_cursor(index);
+                } else if self.windows[index].strip_press.is_some() {
                     self.windows[index].window.request_redraw();
                 }
                 self.sync_tooltip(event_loop, Some(index), true);
             }
             WindowEvent::CursorLeft { .. } => {
-                self.windows[index].cursor = None;
+                let dragging = self.slider_drag == Some(self.windows[index].window.id());
+                if !dragging {
+                    self.windows[index].cursor = None;
+                }
                 self.clear_tooltip();
                 if self.windows[index].strip_press.is_some() {
                     self.windows[index].window.request_redraw();
@@ -391,7 +403,10 @@ impl ApplicationHandler for App {
                 button: MouseButton::Left,
                 ..
             } => {
-                if !self.finish_strip_press(index) {
+                if self.slider_drag == Some(self.windows[index].window.id()) {
+                    self.slider_drag = None;
+                    self.windows[index].present_fault_logged = false;
+                } else if !self.finish_strip_press(index) {
                     self.end_corner_resize(index);
                 }
             }
@@ -706,6 +721,7 @@ impl App {
         let surface = softbuffer::Surface::new(&context, Arc::clone(&window))
             .map_err(|err| self.fill(language::WINDOW_SURFACE_FAILED, &[("err", &err.to_string())]))?;
         let hwnd = hwnd_from_window(&window).ok_or_else(|| self.say(language::NO_HWND).to_string())?;
+        let _ = make_layered(hwnd);
         let affinity = try_exclude_from_capture(hwnd);
         let number = match self.session.handle(
             &mut self.port,
@@ -740,6 +756,7 @@ impl App {
             refreshing: false,
             strip_visible: false,
             strip_press: None,
+            present_fault_logged: false,
             physical_client: (physical_w, physical_h),
         });
         Ok(())
@@ -864,10 +881,18 @@ impl App {
         let Some(shown) = self.shown_image(number) else {
             return;
         };
+        let opacity = self
+            .session
+            .capture(number)
+            .map(|capture| capture.view.opacity)
+            .unwrap_or(255);
         let scale = window.scale_factor();
         let mut frame = compose_patch(&shown, size.width, size.height);
+        let mut pixels = frame.pixels.to_vec();
+        if let Some(placed) = letterbox(frame.width, frame.height, shown.width, shown.height) {
+            fade_picture(&mut pixels, frame.width, frame.height, placed, opacity);
+        }
         if self.windows[index].strip_visible {
-            let mut pixels = frame.pixels.to_vec();
             draw_buttons(
                 &mut pixels,
                 frame.width,
@@ -876,10 +901,45 @@ impl App {
                 self.strip_press_visual(index),
                 button_icons(self.language),
             );
-            frame.pixels = Arc::from(pixels.into_boxed_slice());
+            draw_slider(&mut pixels, frame.width, frame.height, scale, opacity);
         }
-        present_frame(&window, &mut self.windows[index].surface, &frame);
+        premultiply_alpha(&mut pixels);
+        frame.pixels = Arc::from(pixels.into_boxed_slice());
+        match hwnd_from_window(&window) {
+            Some(hwnd) if present_layered(hwnd, &frame.pixels, frame.width, frame.height) => {}
+            _ => self.note_show_failed(index),
+        }
         self.remember_physical_client(index);
+    }
+
+    fn note_show_failed(&mut self, index: usize) {
+        let window_id = self.windows[index].window.id();
+        let dragging = self.slider_drag == Some(window_id);
+        if dragging && self.windows[index].present_fault_logged {
+            return;
+        }
+        let number = self.windows[index].number.to_string();
+        eprintln!("{}", self.fill(language::SHOW_FAILED, &[("number", &number)]));
+        if dragging {
+            self.windows[index].present_fault_logged = true;
+        }
+    }
+
+    fn set_opacity_from_cursor(&mut self, index: usize) {
+        let (width, height) = logical_client_size(&self.windows[index].window);
+        let Some(rect) = slider_rect(width, height) else {
+            return;
+        };
+        let x = self.windows[index].cursor.map(|(x, _)| x).unwrap_or(rect.x);
+        let max = i32::try_from(rect.width).unwrap_or(i32::MAX);
+        let position = (x - rect.x).clamp(0, max) as u32;
+        let opacity = opacity_from_slider(position, rect.width);
+        let number = self.windows[index].number;
+        let _ = self.session.handle(
+            &mut self.port,
+            Request::OpacitySet { number, opacity },
+        );
+        self.windows[index].window.request_redraw();
     }
 
     fn remember_physical_client(&mut self, index: usize) {
@@ -933,6 +993,11 @@ impl App {
     }
 
     fn toggle_strip(&mut self, index: usize) {
+        let window_id = self.windows[index].window.id();
+        if self.windows[index].strip_visible && self.slider_drag == Some(window_id) {
+            self.slider_drag = None;
+            self.windows[index].present_fault_logged = false;
+        }
         self.windows[index].strip_press = None;
         self.windows[index].strip_visible = !self.windows[index].strip_visible;
         self.clear_tooltip();
@@ -953,6 +1018,9 @@ impl App {
             .is_some_and(|corner| corner.window_id == window_id)
         {
             self.corner = None;
+        }
+        if self.slider_drag == Some(window_id) {
+            self.slider_drag = None;
         }
         if self
             .tooltip_hover
@@ -1130,6 +1198,10 @@ impl App {
             }
             PanelAction::Drag => {
                 let _ = window.drag_window();
+            }
+            PanelAction::Slider => {
+                self.slider_drag = Some(window.id());
+                self.set_opacity_from_cursor(index);
             }
             action @ (PanelAction::Refresh
             | PanelAction::BeforeAfter
