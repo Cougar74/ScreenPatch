@@ -495,7 +495,7 @@ fn sample_span(dest: u32, dest_size: u32, source_size: u32) -> (u32, u32) {
     (start, end)
 }
 
-fn sample_icon(icon: &ButtonIcon, x: u32, y: u32, dest_w: u32, dest_h: u32) -> [u8; 4] {
+pub(crate) fn sample_icon(icon: &ButtonIcon, x: u32, y: u32, dest_w: u32, dest_h: u32) -> [u8; 4] {
     let (x0, x1) = sample_span(x, dest_w, icon.width);
     let (y0, y1) = sample_span(y, dest_h, icon.height);
     let mut alpha_sum = 0u32;
@@ -516,7 +516,7 @@ fn sample_icon(icon: &ButtonIcon, x: u32, y: u32, dest_w: u32, dest_h: u32) -> [
     [255, 255, 255, (alpha_sum / count) as u8]
 }
 
-fn blend_pixel(pixels: &mut [u8], width: u32, height: u32, x: i32, y: i32, src: [u8; 4]) {
+pub(crate) fn blend_pixel(pixels: &mut [u8], width: u32, height: u32, x: i32, y: i32, src: [u8; 4]) {
     if x < 0 || y < 0 {
         return;
     }

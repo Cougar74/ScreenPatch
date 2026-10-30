@@ -2,9 +2,10 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use screenpatch::core::geometry::CaptureRect;
+use screenpatch::core::hotkeys::{format_hotkeys, Chord, HotkeyAction, Hotkeys, KeyName};
 use screenpatch::core::language::{
-    render, text, Language, FRAME_TOO_BIG, GEOMETRY_CHANGED, LANGUAGE_SAVE_FAILED, SOURCE_UNSUPPORTED,
-    WINDOW_LIMIT,
+    render, text, Language, FRAME_TOO_BIG, GEOMETRY_CHANGED, HOTKEY_READ_FAILED, HOTKEY_WRITE_FAILED,
+    LANGUAGE_SAVE_FAILED, SOURCE_UNSUPPORTED, WINDOW_LIMIT,
 };
 use screenpatch::core::model::CaptureSource;
 use screenpatch::core::port::PlatformPort;
@@ -22,6 +23,10 @@ struct Fake {
     saved_png: Option<Vec<u8>>,
     snapshots: u32,
     region_captures: u32,
+    hotkey_file: Option<String>,
+    hotkey_read_error: Option<String>,
+    hotkey_write_error: Option<String>,
+    written_hotkeys: Option<String>,
 }
 
 impl PlatformPort for Fake {
@@ -80,6 +85,21 @@ impl PlatformPort for Fake {
         self.copied = Some(pixels.to_vec());
         Ok(())
     }
+
+    fn read_hotkeys(&self) -> Result<Option<String>, String> {
+        if let Some(err) = &self.hotkey_read_error {
+            return Err(err.clone());
+        }
+        Ok(self.hotkey_file.clone())
+    }
+
+    fn write_hotkeys(&mut self, text: &str) -> Result<(), String> {
+        if let Some(err) = &self.hotkey_write_error {
+            return Err(err.clone());
+        }
+        self.written_hotkeys = Some(text.to_string());
+        Ok(())
+    }
 }
 
 fn fingerprint() -> Fingerprint {
@@ -120,6 +140,10 @@ fn fake_ru() -> Fake {
         saved_png: None,
         snapshots: 0,
         region_captures: 0,
+        hotkey_file: None,
+        hotkey_read_error: None,
+        hotkey_write_error: None,
+        written_hotkeys: None,
     }
 }
 
@@ -347,4 +371,80 @@ fn lock_starts_open_and_survives_the_frame() {
     let opened = session.handle(&mut fake, Request::LockToggled { number: 1 });
     assert_eq!(opened, Outcome::ViewUpdated);
     assert!(!session.capture(1).unwrap().view.locked);
+}
+
+#[test]
+fn hotkeys_start_from_the_file_and_a_bad_file_keeps_the_defaults() {
+    let mut fake = fake_ru();
+    fake.hotkey_file = Some("refresh=q\nbad\n".to_string());
+    let session = Session::open(&fake).0;
+    let mut expected = Hotkeys::default();
+    expected.refresh.key = KeyName::Letter('q');
+    assert_eq!(session.hotkeys().refresh, expected.refresh);
+    assert_eq!(session.hotkeys().capture, Hotkeys::default().capture);
+
+    fake.hotkey_file = None;
+    fake.hotkey_read_error = Some("denied".to_string());
+    let (session, _, message) = Session::open(&fake);
+    assert_eq!(session.hotkeys(), &Hotkeys::default());
+    assert_eq!(
+        message.as_deref(),
+        Some(render(Language::Ru, HOTKEY_READ_FAILED, &[("err", "denied")]).as_str())
+    );
+}
+
+#[test]
+fn choosing_a_hotkey_writes_the_file_and_a_duplicate_does_not() {
+    let mut fake = fake_ru();
+    let mut session = open_ru(&mut fake);
+    let outcome = session.handle(
+        &mut fake,
+        Request::HotkeyChosen {
+            action: HotkeyAction::Refresh,
+            chord: Chord {
+                key: KeyName::Letter('q'),
+                ..Hotkeys::default().refresh
+            },
+        },
+    );
+    assert_eq!(outcome, Outcome::HotkeySaved);
+    assert_eq!(
+        fake.written_hotkeys.as_deref(),
+        Some(format_hotkeys(session.hotkeys()).as_str())
+    );
+
+    let duplicate = session.handle(
+        &mut fake,
+        Request::HotkeyChosen {
+            action: HotkeyAction::Capture,
+            chord: Chord {
+                ctrl: false,
+                alt: false,
+                shift: false,
+                win: false,
+                key: KeyName::Letter('k'),
+            },
+        },
+    );
+    assert_eq!(duplicate, Outcome::Ignored);
+    assert!(fake.written_hotkeys.as_ref().unwrap().contains("capture=ctrl+shift+s"));
+
+    fake.hotkey_write_error = Some("full".to_string());
+    let failed = session.handle(
+        &mut fake,
+        Request::HotkeyChosen {
+            action: HotkeyAction::Again,
+            chord: Chord {
+                key: KeyName::Letter('w'),
+                ..Hotkeys::default().again
+            },
+        },
+    );
+    assert_eq!(
+        failed,
+        Outcome::HotkeyFailed {
+            message: render(Language::Ru, HOTKEY_WRITE_FAILED, &[("err", "full")])
+        }
+    );
+    assert_eq!(session.hotkeys().again, Hotkeys::default().again);
 }

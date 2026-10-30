@@ -1,6 +1,10 @@
+use screenpatch::core::hotkeys::{help_key, help_lines, Hotkeys};
 use screenpatch::core::language::{
-    help_key, help_lines, language_choice, parse_saved_language, text, Language, BUTTON_ICON_FAILED,
-    LANGUAGE_NAME_EN, LANGUAGE_NAME_RU, MONITOR_MISSING, TRAY_HELP, TRAY_LANGUAGE, TRAY_NEW,
+    language_choice, parse_saved_language, render, text, Language, BUTTON_ICON_FAILED, HOTKEY_AGAIN,
+    HOTKEY_CHANGE, HOTKEY_CLOSE, HOTKEY_DUPLICATE, HOTKEY_FRAME, HOTKEY_INCLUSIVE, HOTKEY_INCOMPLETE,
+    HOTKEY_NEEDS_MODIFIER, HOTKEY_READ_FAILED, HOTKEY_REGISTER_FAILED, HOTKEY_WRITE_FAILED,
+    LANGUAGE_NAME_EN, LANGUAGE_NAME_RU, MONITOR_MISSING, TRAY_HELP, TRAY_HOTKEYS, TRAY_LANGUAGE,
+    TRAY_NEW,
 };
 
 #[test]
@@ -33,10 +37,17 @@ fn tray_language_and_help_use_the_approved_labels() {
     assert_eq!(LANGUAGE_NAME_EN, "English");
 }
 
+fn help_lines_match(actual: [String; 15], expected: &[&str]) {
+    assert_eq!(actual.len(), expected.len());
+    for (actual, expected) in actual.iter().zip(expected) {
+        assert_eq!(actual, expected);
+    }
+}
+
 #[test]
 fn help_lines_list_the_approved_hotkeys() {
-    assert_eq!(
-        help_lines(Language::Ru),
+    help_lines_match(
+        help_lines(Language::Ru, &Hotkeys::default()),
         &[
             "Горячие клавиши",
             "Ctrl+Shift+S — новый снимок",
@@ -55,8 +66,8 @@ fn help_lines_list_the_approved_hotkeys() {
             "Слайдер — прозрачность картинки",
         ]
     );
-    assert_eq!(
-        help_lines(Language::En),
+    help_lines_match(
+        help_lines(Language::En, &Hotkeys::default()),
         &[
             "Hotkeys",
             "Ctrl+Shift+S — new capture",
@@ -195,4 +206,51 @@ fn button_icon_failure_names_the_read_error() {
         text(Language::En, BUTTON_ICON_FAILED),
         "could not read the button icon: {err}"
     );
+}
+
+#[test]
+fn hotkey_phrases_use_the_approved_words() {
+    assert_eq!(text(Language::Ru, TRAY_HOTKEYS), "Сочетания");
+    assert_eq!(text(Language::En, TRAY_HOTKEYS), "Shortcuts");
+    assert_eq!(text(Language::Ru, HOTKEY_CHANGE), "Изменить");
+    assert_eq!(text(Language::En, HOTKEY_CHANGE), "Change");
+    assert_eq!(text(Language::Ru, HOTKEY_INCOMPLETE), "Сочетание не закончено.");
+    assert_eq!(text(Language::En, HOTKEY_INCOMPLETE), "The shortcut is incomplete.");
+    assert_eq!(
+        text(Language::Ru, HOTKEY_NEEDS_MODIFIER),
+        "Глобальному сочетанию нужен Ctrl, Alt, Shift или Win."
+    );
+    assert_eq!(
+        text(Language::En, HOTKEY_NEEDS_MODIFIER),
+        "A global shortcut needs Ctrl, Alt, Shift, or Win."
+    );
+    assert_eq!(
+        render(Language::Ru, HOTKEY_DUPLICATE, &[("action", "Обновить")]),
+        "Это сочетание уже занято: Обновить."
+    );
+    assert_eq!(
+        render(Language::En, HOTKEY_DUPLICATE, &[("action", "Refresh")]),
+        "This shortcut is already used by Refresh."
+    );
+    assert_eq!(text(Language::Ru, HOTKEY_REGISTER_FAILED), "Система не отдала это сочетание.");
+    assert_eq!(
+        text(Language::En, HOTKEY_REGISTER_FAILED),
+        "The system did not accept this shortcut."
+    );
+    assert_eq!(
+        render(Language::Ru, HOTKEY_READ_FAILED, &[("err", "denied")]),
+        "не удалось прочитать сочетания: denied"
+    );
+    assert_eq!(
+        render(Language::En, HOTKEY_WRITE_FAILED, &[("err", "full")]),
+        "Could not save the shortcuts: full."
+    );
+    assert_eq!(text(Language::Ru, HOTKEY_INCLUSIVE), "Снимок с окнами программы");
+    assert_eq!(text(Language::En, HOTKEY_INCLUSIVE), "Capture with the app windows");
+    assert_eq!(text(Language::Ru, HOTKEY_FRAME), "Размер кадра");
+    assert_eq!(text(Language::En, HOTKEY_FRAME), "Frame size");
+    assert_eq!(text(Language::Ru, HOTKEY_AGAIN), "Новый снимок из окна");
+    assert_eq!(text(Language::En, HOTKEY_AGAIN), "New capture from the window");
+    assert_eq!(text(Language::Ru, HOTKEY_CLOSE), "Закрыть снимок");
+    assert_eq!(text(Language::En, HOTKEY_CLOSE), "Close the capture");
 }

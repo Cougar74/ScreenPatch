@@ -121,6 +121,10 @@ pub fn place_window(
 
 pub const HELP_CLIENT_WIDTH: u32 = 560;
 pub const HELP_CLIENT_HEIGHT: u32 = 460;
+pub const HOTKEY_LIST_WIDTH: u32 = 480;
+pub const HOTKEY_LIST_HEIGHT: u32 = 272;
+pub const HOTKEY_CAPTURE_WIDTH: u32 = 360;
+pub const HOTKEY_CAPTURE_HEIGHT: u32 = 140;
 pub const HELP_PAD_X: i32 = 24;
 pub const HELP_PAD_Y: i32 = 20;
 pub const HELP_LINE_HEIGHT: i32 = 28;
@@ -130,9 +134,54 @@ pub fn help_line_top(index: usize) -> i32 {
 }
 
 pub fn help_window_origin(work: WorkArea) -> (i32, i32) {
-    let x = work.x + (i32::try_from(work.width).unwrap_or(i32::MAX) - HELP_CLIENT_WIDTH as i32) / 2;
-    let y =
-        work.y + (i32::try_from(work.height).unwrap_or(i32::MAX) - HELP_CLIENT_HEIGHT as i32) / 2;
+    window_origin(work, HELP_CLIENT_WIDTH, HELP_CLIENT_HEIGHT)
+}
+
+pub fn hotkey_list_origin(work: WorkArea) -> (i32, i32) {
+    window_origin(work, HOTKEY_LIST_WIDTH, HOTKEY_LIST_HEIGHT)
+}
+
+pub fn hotkey_capture_origin(work: WorkArea) -> (i32, i32) {
+    window_origin(work, HOTKEY_CAPTURE_WIDTH, HOTKEY_CAPTURE_HEIGHT)
+}
+
+pub fn hotkey_row_button(index: usize) -> Option<(i32, i32, u32, u32)> {
+    if index >= 6 {
+        return None;
+    }
+    let y = 16 + i32::try_from(index).unwrap_or(0) * 40 + 5;
+    Some((i32::try_from(HOTKEY_LIST_WIDTH).unwrap_or(0) - 46, y, 30, 30))
+}
+
+pub fn hotkey_row_at(x: i32, y: i32) -> Option<usize> {
+    (0..6).find(|index| {
+        let Some((left, top, width, height)) = hotkey_row_button(*index) else {
+            return false;
+        };
+        let cx = left + i32::try_from(width / 2).unwrap_or(0);
+        let cy = top + i32::try_from(height / 2).unwrap_or(0);
+        let dx = x - cx;
+        let dy = y - cy;
+        dx * dx + dy * dy <= 15 * 15
+    })
+}
+
+pub fn hotkey_change_button() -> (i32, i32, u32, u32) {
+    let width = 120;
+    let height = 32;
+    let x = (i32::try_from(HOTKEY_CAPTURE_WIDTH).unwrap_or(0) - width) / 2;
+    let y = i32::try_from(HOTKEY_CAPTURE_HEIGHT).unwrap_or(0) - 16 - height;
+    (x, y, u32::try_from(width).unwrap_or(0), u32::try_from(height).unwrap_or(0))
+}
+
+pub fn hotkey_change_hit(x: i32, y: i32) -> bool {
+    let (left, top, width, height) = hotkey_change_button();
+    x >= left && y >= top && x < left + i32::try_from(width).unwrap_or(0) && y < top + i32::try_from(height).unwrap_or(0)
+}
+
+fn window_origin(work: WorkArea, width: u32, height: u32) -> (i32, i32) {
+    let x = work.x + (i32::try_from(work.width).unwrap_or(i32::MAX) - width as i32) / 2;
+    let y = work.y + (i32::try_from(work.height).unwrap_or(i32::MAX) - height as i32) / 2;
     (x, y)
 }
 

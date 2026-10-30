@@ -14,7 +14,7 @@ use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::keyboard::{Key, NamedKey};
+use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{CursorGrabMode, CursorIcon, Window, WindowAttributes, WindowId, WindowLevel};
 use windows::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
@@ -26,8 +26,12 @@ use screenpatch::core::commands::{
     gesture_allowed, opacity_from_slider, premultiply_alpha, slider_rect, strip_press_target,
     ButtonIcon, PanelAction,
 };
+use screenpatch::core::hotkeys::{
+    capture_preview, display_chord, help_lines, hotkey_rejection, Chord, HotkeyAction, HotkeyRejection,
+    Hotkeys, KeyName,
+};
 use screenpatch::core::language::{
-    self, help_lines, language_choice, Language, LANGUAGE_NAME_EN, LANGUAGE_NAME_RU,
+    self, language_choice, Language, LANGUAGE_NAME_EN, LANGUAGE_NAME_RU,
 };
 use screenpatch::core::tooltip::{
     action_tip, note_hover, tooltip_client_size, tooltip_due, tooltip_origin, TooltipHover,
@@ -36,7 +40,9 @@ use screenpatch::core::tooltip::{
 use screenpatch::core::geometry::{
     logical_client_keeping_physical, logical_to_physical_px, logical_window_size,
     one_to_one_physical_size, place_window, shift_into_work_area, CaptureRect, LogicalRect,
-    WorkArea, HELP_CLIENT_HEIGHT, HELP_CLIENT_WIDTH, help_window_origin, index_containing_point,
+    WorkArea, HELP_CLIENT_HEIGHT, HELP_CLIENT_WIDTH, help_window_origin, hotkey_capture_origin,
+    hotkey_change_hit, hotkey_list_origin, hotkey_row_at, index_containing_point,
+    HOTKEY_CAPTURE_HEIGHT, HOTKEY_CAPTURE_WIDTH, HOTKEY_LIST_HEIGHT, HOTKEY_LIST_WIDTH,
 };
 use screenpatch::core::model::{CaptureSource, ShownFrame};
 use screenpatch::core::patches::letterbox;
@@ -49,7 +55,8 @@ use screenpatch::core::session::{Outcome, Request, Session};
 use screenpatch::platform::{
     acquire_single_instance, choose_png_path, confirm_close_all, cursor_screen_point,
     hwnd_from_window, list_displays, make_layered, make_tooltip_click_through, measure_tooltip_text,
-    paint_help, paint_tooltip, place_tooltip_window, present_layered, round_tooltip_window,
+    paint_help, paint_hotkey_capture, paint_hotkey_list, paint_tooltip, place_tooltip_window,
+    present_layered, round_tooltip_window,
     set_capture_excluded, suggested_png_name, try_exclude_from_capture, DisplayInfo, Hwnd,
     WindowsPlatform,
 };
@@ -116,6 +123,28 @@ struct HelpWindow {
     context: softbuffer::Context<Arc<Window>>,
 }
 
+struct HotkeyListWindow {
+    window: Arc<Window>,
+    surface: softbuffer::Surface<Arc<Window>, Arc<Window>>,
+    #[allow(dead_code)]
+    context: softbuffer::Context<Arc<Window>>,
+    cursor: Option<(i32, i32)>,
+    pressed: Option<usize>,
+}
+
+struct HotkeyCaptureWindow {
+    window: Arc<Window>,
+    surface: softbuffer::Surface<Arc<Window>, Arc<Window>>,
+    #[allow(dead_code)]
+    context: softbuffer::Context<Arc<Window>>,
+    action: HotkeyAction,
+    shown: Option<Chord>,
+    message: Option<String>,
+    key_down: bool,
+    cursor: Option<(i32, i32)>,
+    pressed: bool,
+}
+
 struct TooltipWindow {
     window: Arc<Window>,
     surface: softbuffer::Surface<Arc<Window>, Arc<Window>>,
@@ -146,6 +175,12 @@ struct App {
     tray: Option<TrayIcon>,
     tray_menus: Option<TrayMenus>,
     help: Option<HelpWindow>,
+    hotkey_list: Option<HotkeyListWindow>,
+    hotkey_capture: Option<HotkeyCaptureWindow>,
+    key_modifiers: ModifiersState,
+    registered_capture: Chord,
+    registered_inclusive: Chord,
+    hotkey_rollback: Option<(HotkeyAction, Chord)>,
     tooltip: Option<TooltipWindow>,
     tooltip_hover: Option<TooltipHover<WindowId>>,
     tooltip_create_logged: bool,
@@ -170,8 +205,11 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let mut port = WindowsPlatform::new(screenpatch::core::language::Language::En);
-    let (session, read_error) = Session::open(&port);
+    let (session, read_error, hotkey_error) = Session::open(&port);
     if let Some(message) = read_error {
+        eprintln!("{message}");
+    }
+    if let Some(message) = hotkey_error {
         eprintln!("{message}");
     }
     let language = session.language();
@@ -185,6 +223,8 @@ fn run() -> Result<(), String> {
     let event_loop = EventLoop::new().map_err(|err| {
         language::render(language, language::EVENT_LOOP_CREATE_FAILED, &[("err", &err.to_string())])
     })?;
+    let registered_capture = session.hotkeys().capture;
+    let registered_inclusive = session.hotkeys().inclusive;
     let mut app = App {
         prepared: None,
         overlays: Vec::new(),
@@ -198,6 +238,12 @@ fn run() -> Result<(), String> {
         tray: None,
         tray_menus: None,
         help: None,
+        hotkey_list: None,
+        hotkey_capture: None,
+        key_modifiers: ModifiersState::empty(),
+        registered_capture,
+        registered_inclusive,
+        hotkey_rollback: None,
         tooltip: None,
         tooltip_hover: None,
         tooltip_create_logged: false,
@@ -317,12 +363,32 @@ impl ApplicationHandler for App {
         window_id: WindowId,
         event: WindowEvent,
     ) {
+        if let WindowEvent::ModifiersChanged(modifiers) = &event {
+            self.key_modifiers = modifiers.state();
+            self.refresh_hotkey_capture_preview();
+        }
         if self
             .tooltip
             .as_ref()
             .is_some_and(|tooltip| tooltip.window.id() == window_id)
         {
             self.tooltip_event(event_loop, event);
+            return;
+        }
+        if self
+            .hotkey_capture
+            .as_ref()
+            .is_some_and(|capture| capture.window.id() == window_id)
+        {
+            self.hotkey_capture_event(event);
+            return;
+        }
+        if self
+            .hotkey_list
+            .as_ref()
+            .is_some_and(|list| list.window.id() == window_id)
+        {
+            self.hotkey_list_event(event_loop, event);
             return;
         }
         if self
@@ -356,14 +422,21 @@ impl ApplicationHandler for App {
                 if event.state != ElementState::Pressed || event.repeat || is_synthetic {
                     return;
                 }
-                match event.logical_key {
-                    Key::Named(NamedKey::Escape) => self.close_patch(index),
-                    Key::Character(text) if text.eq_ignore_ascii_case("r") => self.refresh(index),
-                    Key::Character(text) if text == "1" => self.restore_actual_size(index),
-                    Key::Character(text) if text.eq_ignore_ascii_case("s") => {
-                        self.begin_selection(event_loop, false)
-                    }
-                    _ => {}
+                if self.hotkey_capture.is_some() {
+                    return;
+                }
+                let Some(chord) = self.chord_from_key(&event.logical_key) else {
+                    return;
+                };
+                let hotkeys = *self.session.hotkeys();
+                if chord == hotkeys.close {
+                    self.close_patch(index);
+                } else if chord == hotkeys.refresh {
+                    self.refresh(index);
+                } else if chord == hotkeys.frame {
+                    self.restore_actual_size(index);
+                } else if chord == hotkeys.again {
+                    self.begin_selection(event_loop, false);
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
@@ -1349,6 +1422,7 @@ impl App {
             MenuItem::with_id("hide", self.say(language::TRAY_HIDE), true, None),
             MenuItem::with_id("close-all", self.say(language::TRAY_CLOSE_ALL), true, None),
             MenuItem::with_id("help", self.say(language::TRAY_HELP), true, None),
+            MenuItem::with_id("hotkeys", self.say(language::TRAY_HOTKEYS), true, None),
             MenuItem::with_id("exit", self.say(language::TRAY_EXIT), true, None),
         ];
         let russian = CheckMenuItem::with_id(
@@ -1382,8 +1456,9 @@ impl App {
             &above,
             &language_menu,
             &items[4],
-            &below,
             &items[5],
+            &below,
+            &items[6],
         ];
         menu.append_items(&refs)
             .map_err(|err| self.fill(language::MENU_FAILED, &[("err", &err.to_string())]))?;
@@ -1432,6 +1507,17 @@ impl App {
             help.window.set_title(self.say(language::TRAY_HELP));
             help.window.request_redraw();
         }
+        if let Some(list) = &self.hotkey_list {
+            list.window.set_title(self.say(language::TRAY_HOTKEYS));
+            list.window.request_redraw();
+        }
+        if let Some(action) = self.hotkey_capture.as_ref().map(|capture| capture.action) {
+            let title = self.say(hotkey_phrase(action));
+            if let Some(capture) = &self.hotkey_capture {
+                capture.window.set_title(title);
+                capture.window.request_redraw();
+            }
+        }
         if self.tooltip_hover.is_some_and(|hover| hover.shown) {
             let _ = self.relayout_tooltip();
         }
@@ -1458,7 +1544,7 @@ impl App {
             .map_err(|err| self.fill(language::TRAY_CREATE_FAILED, &[("err", &err.to_string())]))?;
         self.tray_menus = Some(menus);
         self.tray = Some(tray);
-        match register_hotkeys() {
+        match register_hotkeys(self.session.hotkeys()) {
             Ok(registered) => {
                 if let Some(err) = registered.capture_error {
                     eprintln!("{}", self.fill(language::HOTKEY_BUSY, &[("err", &err)]));
@@ -1483,6 +1569,9 @@ impl App {
             self.menu_command(event_loop, &event.id);
         }
         while let Ok(event) = GlobalHotKeyEvent::receiver().try_recv() {
+            if self.hotkey_capture.is_some() {
+                continue;
+            }
             if self.hotkeys.is_some() && event.state == HotKeyState::Pressed {
                 if self.hotkey_id != 0 && event.id == self.hotkey_id {
                     self.begin_selection(event_loop, false);
@@ -1508,6 +1597,8 @@ impl App {
             self.choose_language(Language::En);
         } else if id == "help" {
             self.open_help(event_loop);
+        } else if id == "hotkeys" {
+            self.open_hotkey_list(event_loop);
         } else if id == "exit" {
             self.exit_app(event_loop);
         }
@@ -1632,12 +1723,9 @@ impl App {
             return;
         };
         let size = window.inner_size();
-        let pixels = paint_help(
-            size.width,
-            size.height,
-            window.scale_factor(),
-            help_lines(self.language),
-        );
+        let lines = help_lines(self.language, self.session.hotkeys());
+        let line_refs: [&str; 15] = std::array::from_fn(|index| lines[index].as_str());
+        let pixels = paint_help(size.width, size.height, window.scale_factor(), &line_refs);
         let frame = ImageFrame {
             pixels: Arc::from(pixels.into_boxed_slice()),
             width: size.width,
@@ -1647,6 +1735,567 @@ impl App {
             return;
         };
         present_frame(&window, &mut help.surface, &frame);
+    }
+
+    fn open_hotkey_list(&mut self, event_loop: &ActiveEventLoop) {
+        if let Some(list) = &self.hotkey_list {
+            list.window.set_minimized(false);
+            list.window.set_visible(true);
+            list.window.focus_window();
+            return;
+        }
+        let Some((window, context, surface)) = self.open_client_window(
+            event_loop,
+            self.say(language::TRAY_HOTKEYS),
+            HOTKEY_LIST_WIDTH,
+            HOTKEY_LIST_HEIGHT,
+            hotkey_list_origin,
+        ) else {
+            return;
+        };
+        window.request_redraw();
+        self.hotkey_list = Some(HotkeyListWindow {
+            window,
+            surface,
+            context,
+            cursor: None,
+            pressed: None,
+        });
+    }
+
+    fn open_hotkey_capture(&mut self, event_loop: &ActiveEventLoop, action: HotkeyAction) {
+        self.hotkey_capture = None;
+        let Some((window, context, surface)) = self.open_client_window(
+            event_loop,
+            self.say(hotkey_phrase(action)),
+            HOTKEY_CAPTURE_WIDTH,
+            HOTKEY_CAPTURE_HEIGHT,
+            hotkey_capture_origin,
+        ) else {
+            return;
+        };
+        window.request_redraw();
+        self.hotkey_capture = Some(HotkeyCaptureWindow {
+            window,
+            surface,
+            context,
+            action,
+            shown: None,
+            message: None,
+            key_down: false,
+            cursor: None,
+            pressed: false,
+        });
+    }
+
+    fn open_client_window(
+        &self,
+        event_loop: &ActiveEventLoop,
+        title: &str,
+        width: u32,
+        height: u32,
+        origin: fn(WorkArea) -> (i32, i32),
+    ) -> Option<(
+        Arc<Window>,
+        softbuffer::Context<Arc<Window>>,
+        softbuffer::Surface<Arc<Window>, Arc<Window>>,
+    )> {
+        let displays = match list_displays(self.language) {
+            Ok(displays) if !displays.is_empty() => displays,
+            Ok(_) => {
+                eprintln!("{}", self.say(language::NO_MONITORS));
+                return None;
+            }
+            Err(err) => {
+                eprintln!("{}", err.message);
+                return None;
+            }
+        };
+        let Some(index) = help_display_index(&displays) else {
+            eprintln!("{}", self.say(language::WORK_AREA_SCALE));
+            return None;
+        };
+        let display = &displays[index];
+        let (local_x, local_y) = origin(display.work);
+        let Some(offset_x) = logical_to_physical_px(local_x, display.scale) else {
+            eprintln!("{}", self.say(language::WORK_AREA_SCALE));
+            return None;
+        };
+        let Some(offset_y) = logical_to_physical_px(local_y, display.scale) else {
+            eprintln!("{}", self.say(language::WORK_AREA_SCALE));
+            return None;
+        };
+        let Some(position_x) = display.origin_x.checked_add(offset_x) else {
+            eprintln!("{}", self.say(language::WORK_AREA_SCALE));
+            return None;
+        };
+        let Some(position_y) = display.origin_y.checked_add(offset_y) else {
+            eprintln!("{}", self.say(language::WORK_AREA_SCALE));
+            return None;
+        };
+        let attributes = apply_window_icon(
+            self.language,
+            WindowAttributes::default()
+                .with_title(title)
+                .with_resizable(false)
+                .with_inner_size(LogicalSize::new(width as f64, height as f64))
+                .with_position(PhysicalPosition::new(position_x, position_y)),
+        );
+        let window = match event_loop.create_window(attributes) {
+            Ok(window) => Arc::new(window),
+            Err(err) => {
+                eprintln!(
+                    "{}",
+                    self.fill(language::WINDOW_CREATE_FAILED, &[("err", &err.to_string())])
+                );
+                return None;
+            }
+        };
+        let context = match softbuffer::Context::new(Arc::clone(&window)) {
+            Ok(context) => context,
+            Err(err) => {
+                eprintln!(
+                    "{}",
+                    self.fill(language::WINDOW_BUFFER_FAILED, &[("err", &err.to_string())])
+                );
+                return None;
+            }
+        };
+        let surface = match softbuffer::Surface::new(&context, Arc::clone(&window)) {
+            Ok(surface) => surface,
+            Err(err) => {
+                eprintln!(
+                    "{}",
+                    self.fill(language::WINDOW_SURFACE_FAILED, &[("err", &err.to_string())])
+                );
+                return None;
+            }
+        };
+        Some((window, context, surface))
+    }
+
+    fn hotkey_list_event(&mut self, event_loop: &ActiveEventLoop, event: WindowEvent) {
+        match event {
+            WindowEvent::CloseRequested => {
+                self.hotkey_list = None;
+                self.hotkey_capture = None;
+            }
+            WindowEvent::KeyboardInput { event, is_synthetic, .. } => {
+                if event.state != ElementState::Pressed || event.repeat || is_synthetic {
+                    return;
+                }
+                if event.logical_key == Key::Named(NamedKey::Escape) {
+                    self.hotkey_list = None;
+                    self.hotkey_capture = None;
+                }
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                let scale = self.hotkey_list.as_ref().map(|list| list.window.scale_factor()).unwrap_or(1.0);
+                if let Some(list) = &mut self.hotkey_list {
+                    list.cursor = logical_client_point(position.x, position.y, scale);
+                }
+            }
+            WindowEvent::CursorLeft { .. } => {
+                if let Some(list) = &mut self.hotkey_list {
+                    list.cursor = None;
+                }
+            }
+            WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
+                let hit = self.hotkey_list.as_ref().and_then(|list| list.cursor).and_then(|(x, y)| hotkey_row_at(x, y));
+                if let Some(list) = &mut self.hotkey_list {
+                    list.pressed = hit;
+                    list.window.request_redraw();
+                }
+            }
+            WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left, .. } => {
+                let pressed = self.hotkey_list.as_ref().and_then(|list| list.pressed);
+                let hit = self.hotkey_list.as_ref().and_then(|list| list.cursor).and_then(|(x, y)| hotkey_row_at(x, y));
+                if let Some(list) = &mut self.hotkey_list {
+                    list.pressed = None;
+                    list.window.request_redraw();
+                }
+                if pressed == hit {
+                    if let Some(index) = hit {
+                        self.open_hotkey_capture(event_loop, hotkey_actions()[index]);
+                    }
+                }
+            }
+            WindowEvent::RedrawRequested => self.paint_hotkey_list_window(),
+            WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
+                if let Some(list) = &self.hotkey_list {
+                    list.window.request_redraw();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn hotkey_capture_event(&mut self, event: WindowEvent) {
+        match event {
+            WindowEvent::CloseRequested => self.hotkey_capture = None,
+            WindowEvent::KeyboardInput { event, is_synthetic, .. } => {
+                if is_synthetic {
+                    return;
+                }
+                if event.state == ElementState::Released {
+                    if self.chord_from_key(&event.logical_key).is_some() {
+                        if let Some(capture) = &mut self.hotkey_capture {
+                            capture.key_down = false;
+                        }
+                    }
+                    return;
+                }
+                if event.state != ElementState::Pressed || event.repeat {
+                    return;
+                }
+                if event.logical_key == Key::Named(NamedKey::Escape) {
+                    self.hotkey_capture = None;
+                    return;
+                }
+                if event.logical_key == Key::Named(NamedKey::Enter) {
+                    self.commit_shown_hotkey();
+                    return;
+                }
+                if let Some(chord) = self.chord_from_key(&event.logical_key) {
+                    if let Some(capture) = &mut self.hotkey_capture {
+                        capture.shown = Some(chord);
+                        capture.message = None;
+                        capture.key_down = true;
+                        capture.window.request_redraw();
+                    }
+                }
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                let scale = self.hotkey_capture.as_ref().map(|capture| capture.window.scale_factor()).unwrap_or(1.0);
+                if let Some(capture) = &mut self.hotkey_capture {
+                    capture.cursor = logical_client_point(position.x, position.y, scale);
+                    if capture.pressed {
+                        capture.window.request_redraw();
+                    }
+                }
+            }
+            WindowEvent::CursorLeft { .. } => {
+                if let Some(capture) = &mut self.hotkey_capture {
+                    capture.cursor = None;
+                    if capture.pressed {
+                        capture.window.request_redraw();
+                    }
+                }
+            }
+            WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
+                let hit = self.hotkey_capture.as_ref().and_then(|capture| capture.cursor).is_some_and(|(x, y)| hotkey_change_hit(x, y));
+                if let Some(capture) = &mut self.hotkey_capture {
+                    capture.pressed = hit;
+                    capture.window.request_redraw();
+                }
+            }
+            WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left, .. } => {
+                let armed = self.hotkey_capture.as_ref().is_some_and(|capture| {
+                    capture.pressed && capture.cursor.is_some_and(|(x, y)| hotkey_change_hit(x, y))
+                });
+                if let Some(capture) = &mut self.hotkey_capture {
+                    capture.pressed = false;
+                    capture.window.request_redraw();
+                }
+                if armed {
+                    self.commit_shown_hotkey();
+                }
+            }
+            WindowEvent::RedrawRequested => self.paint_hotkey_capture_window(),
+            WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
+                if let Some(capture) = &self.hotkey_capture {
+                    capture.window.request_redraw();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn paint_hotkey_list_window(&mut self) {
+        let Some(window) = self.hotkey_list.as_ref().map(|list| Arc::clone(&list.window)) else {
+            return;
+        };
+        let pressed = self.hotkey_list.as_ref().and_then(|list| list.pressed);
+        let rows: [String; 6] = std::array::from_fn(|index| {
+            let action = hotkey_actions()[index];
+            format!(
+                "{}    {}",
+                self.say(hotkey_phrase(action)),
+                display_chord(self.session.hotkeys().get(action))
+            )
+        });
+        let refs: [&str; 6] = std::array::from_fn(|index| rows[index].as_str());
+        let size = window.inner_size();
+        let pixels = paint_hotkey_list(
+            size.width,
+            size.height,
+            window.scale_factor(),
+            &refs,
+            pressed,
+            edit_icon(self.language),
+        );
+        let frame = ImageFrame {
+            pixels: Arc::from(pixels.into_boxed_slice()),
+            width: size.width,
+            height: size.height,
+        };
+        let Some(list) = &mut self.hotkey_list else {
+            return;
+        };
+        present_frame(&window, &mut list.surface, &frame);
+    }
+
+    fn paint_hotkey_capture_window(&mut self) {
+        let Some(window) = self.hotkey_capture.as_ref().map(|capture| Arc::clone(&capture.window)) else {
+            return;
+        };
+        let ctrl = self.key_modifiers.control_key();
+        let alt = self.key_modifiers.alt_key();
+        let shift = self.key_modifiers.shift_key();
+        let win = self.key_modifiers.super_key();
+        let text = self.hotkey_capture.as_ref().map(|capture| {
+            if let Some(message) = &capture.message {
+                message.clone()
+            } else {
+                capture_preview(capture.shown, ctrl, alt, shift, win)
+            }
+        }).unwrap_or_default();
+        let pressed = self.hotkey_capture.as_ref().is_some_and(|capture| {
+            capture.pressed && capture.cursor.is_some_and(|(x, y)| hotkey_change_hit(x, y))
+        });
+        let button = self.say(language::HOTKEY_CHANGE);
+        let size = window.inner_size();
+        let pixels = paint_hotkey_capture(size.width, size.height, window.scale_factor(), &text, button, pressed);
+        let frame = ImageFrame {
+            pixels: Arc::from(pixels.into_boxed_slice()),
+            width: size.width,
+            height: size.height,
+        };
+        let Some(capture) = &mut self.hotkey_capture else {
+            return;
+        };
+        present_frame(&window, &mut capture.surface, &frame);
+    }
+
+    fn commit_shown_hotkey(&mut self) {
+        let Some(capture) = self.hotkey_capture.as_ref() else {
+            return;
+        };
+        let action = capture.action;
+        let Some(chord) = capture.shown else {
+            self.set_hotkey_message(self.say(language::HOTKEY_INCOMPLETE).to_string());
+            return;
+        };
+        if let Some(reason) = hotkey_rejection(self.session.hotkeys(), action, chord) {
+            self.set_hotkey_message(self.rejection_text(reason));
+            return;
+        }
+        let global = matches!(action, HotkeyAction::Capture | HotkeyAction::Inclusive);
+        if global && !self.install_global_hotkey(action, chord) {
+            return;
+        }
+        let outcome = self.session.handle(
+            &mut self.port,
+            Request::HotkeyChosen { action, chord },
+        );
+        match outcome {
+            Outcome::HotkeySaved => {
+                self.hotkey_rollback = None;
+                self.hotkey_capture = None;
+                if let Some(list) = &self.hotkey_list {
+                    list.window.request_redraw();
+                }
+                if let Some(help) = &self.help {
+                    help.window.request_redraw();
+                }
+            }
+            Outcome::HotkeyFailed { message } => {
+                if global {
+                    self.rollback_global_hotkey(action);
+                }
+                self.set_hotkey_message(message);
+            }
+            Outcome::Ignored => {
+                if global {
+                    self.rollback_global_hotkey(action);
+                }
+                if let Some(reason) = hotkey_rejection(self.session.hotkeys(), action, chord) {
+                    self.set_hotkey_message(self.rejection_text(reason));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn refresh_hotkey_capture_preview(&mut self) {
+        let ctrl = self.key_modifiers.control_key();
+        let alt = self.key_modifiers.alt_key();
+        let shift = self.key_modifiers.shift_key();
+        let win = self.key_modifiers.super_key();
+        let held = ctrl || alt || shift || win;
+        let Some(capture) = &mut self.hotkey_capture else {
+            return;
+        };
+        if capture.key_down {
+            if let Some(chord) = capture.shown.as_mut() {
+                chord.ctrl = ctrl;
+                chord.alt = alt;
+                chord.shift = shift;
+                chord.win = win;
+            }
+        }
+        if held {
+            capture.message = None;
+        }
+        capture.window.request_redraw();
+    }
+
+    fn set_hotkey_message(&mut self, message: String) {
+        if let Some(capture) = &mut self.hotkey_capture {
+            capture.message = Some(message);
+            capture.window.request_redraw();
+        }
+    }
+
+    fn rejection_text(&self, reason: HotkeyRejection) -> String {
+        match reason {
+            HotkeyRejection::NeedsModifier => self.say(language::HOTKEY_NEEDS_MODIFIER).to_string(),
+            HotkeyRejection::Duplicate(action) => {
+                self.fill(language::HOTKEY_DUPLICATE, &[("action", self.say(hotkey_phrase(action)))])
+            }
+        }
+    }
+
+    fn install_global_hotkey(&mut self, action: HotkeyAction, next: Chord) -> bool {
+        let previous = self.registered_chord(action);
+        self.unregister_chord(previous);
+        match self.try_register(next) {
+            Ok(id) => {
+                self.set_registered(action, next, id);
+                self.hotkey_rollback = Some((action, previous));
+                true
+            }
+            Err(_) => {
+                self.restore_registered(action, previous);
+                self.set_hotkey_message(self.say(language::HOTKEY_REGISTER_FAILED).to_string());
+                false
+            }
+        }
+    }
+
+    fn rollback_global_hotkey(&mut self, action: HotkeyAction) {
+        let Some((saved, previous)) = self.hotkey_rollback.take() else {
+            return;
+        };
+        if saved != action {
+            self.hotkey_rollback = Some((saved, previous));
+            return;
+        }
+        self.unregister_chord(self.registered_chord(action));
+        self.restore_registered(action, previous);
+    }
+
+    fn restore_registered(&mut self, action: HotkeyAction, chord: Chord) {
+        match self.try_register(chord) {
+            Ok(id) => self.set_registered(action, chord, id),
+            Err(err) => {
+                self.set_registered(action, chord, 0);
+                self.log_hotkey_busy(action, &err);
+            }
+        }
+    }
+
+    fn try_register(&self, chord: Chord) -> Result<u32, String> {
+        let manager = self.hotkeys.as_ref().ok_or_else(|| "hotkey".to_string())?;
+        let hotkey = global_hotkey(chord).ok_or_else(|| "hotkey".to_string())?;
+        let id = hotkey.id();
+        manager.register(hotkey).map_err(|err| err.to_string())?;
+        Ok(id)
+    }
+
+    fn unregister_chord(&self, chord: Chord) {
+        let Some(manager) = &self.hotkeys else {
+            return;
+        };
+        let Some(hotkey) = global_hotkey(chord) else {
+            return;
+        };
+        let _ = manager.unregister(hotkey);
+    }
+
+    fn set_registered(&mut self, action: HotkeyAction, chord: Chord, id: u32) {
+        match action {
+            HotkeyAction::Capture => {
+                self.registered_capture = chord;
+                self.hotkey_id = id;
+            }
+            HotkeyAction::Inclusive => {
+                self.registered_inclusive = chord;
+                self.inclusive_hotkey_id = id;
+            }
+            _ => {}
+        }
+    }
+
+    fn registered_chord(&self, action: HotkeyAction) -> Chord {
+        match action {
+            HotkeyAction::Inclusive => self.registered_inclusive,
+            _ => self.registered_capture,
+        }
+    }
+
+    fn log_hotkey_busy(&self, action: HotkeyAction, err: &str) {
+        let phrase = match action {
+            HotkeyAction::Inclusive => language::HOTKEY_INCLUSIVE_BUSY,
+            _ => language::HOTKEY_BUSY,
+        };
+        eprintln!("{}", self.fill(phrase, &[("err", err)]));
+    }
+
+    fn chord_from_key(&self, key: &Key) -> Option<Chord> {
+        let name = match key {
+            Key::Named(NamedKey::Escape) => KeyName::Esc,
+            Key::Named(NamedKey::Space) => KeyName::Space,
+            Key::Named(NamedKey::Tab) => KeyName::Tab,
+            Key::Named(NamedKey::ArrowUp) => KeyName::Up,
+            Key::Named(NamedKey::ArrowDown) => KeyName::Down,
+            Key::Named(NamedKey::ArrowLeft) => KeyName::Left,
+            Key::Named(NamedKey::ArrowRight) => KeyName::Right,
+            Key::Named(NamedKey::F1) => KeyName::Function(1),
+            Key::Named(NamedKey::F2) => KeyName::Function(2),
+            Key::Named(NamedKey::F3) => KeyName::Function(3),
+            Key::Named(NamedKey::F4) => KeyName::Function(4),
+            Key::Named(NamedKey::F5) => KeyName::Function(5),
+            Key::Named(NamedKey::F6) => KeyName::Function(6),
+            Key::Named(NamedKey::F7) => KeyName::Function(7),
+            Key::Named(NamedKey::F8) => KeyName::Function(8),
+            Key::Named(NamedKey::F9) => KeyName::Function(9),
+            Key::Named(NamedKey::F10) => KeyName::Function(10),
+            Key::Named(NamedKey::F11) => KeyName::Function(11),
+            Key::Named(NamedKey::F12) => KeyName::Function(12),
+            Key::Character(text) => {
+                let mut chars = text.chars();
+                let ch = chars.next()?;
+                if chars.next().is_some() {
+                    return None;
+                }
+                if ch.is_ascii_digit() {
+                    KeyName::Digit(u8::try_from(ch.to_digit(10)?).unwrap_or(0))
+                } else if ch.is_ascii_alphabetic() {
+                    KeyName::Letter(ch.to_ascii_lowercase())
+                } else {
+                    return None;
+                }
+            }
+            _ => return None,
+        };
+        Some(Chord {
+            ctrl: self.key_modifiers.control_key(),
+            alt: self.key_modifiers.alt_key(),
+            shift: self.key_modifiers.shift_key(),
+            win: self.key_modifiers.super_key(),
+            key: name,
+        })
     }
 
     fn tooltip_event(&mut self, event_loop: &ActiveEventLoop, event: WindowEvent) {
@@ -2157,29 +2806,112 @@ struct RegisteredHotkeys {
     inclusive_error: Option<String>,
 }
 
-fn register_hotkeys() -> Result<RegisteredHotkeys, String> {
+fn register_hotkeys(hotkeys: &Hotkeys) -> Result<RegisteredHotkeys, String> {
     let manager = GlobalHotKeyManager::new().map_err(|err| err.to_string())?;
-    let capture = HotKey::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyS);
-    let inclusive = HotKey::new(
-        Some(Modifiers::CONTROL | Modifiers::ALT | Modifiers::SHIFT),
-        Code::KeyS,
-    );
-    let capture_key = capture.id();
-    let inclusive_key = inclusive.id();
-    let (capture_id, capture_error) = match manager.register(capture) {
-        Ok(()) => (Some(capture_key), None),
-        Err(err) => (None, Some(err.to_string())),
-    };
-    let (inclusive_id, inclusive_error) = match manager.register(inclusive) {
-        Ok(()) => (Some(inclusive_key), None),
-        Err(err) => (None, Some(err.to_string())),
-    };
+    let (capture_id, capture_error) = register_one(&manager, hotkeys.capture);
+    let (inclusive_id, inclusive_error) = register_one(&manager, hotkeys.inclusive);
     Ok(RegisteredHotkeys {
         manager,
         capture_id,
         inclusive_id,
         capture_error,
         inclusive_error,
+    })
+}
+
+fn register_one(manager: &GlobalHotKeyManager, chord: Chord) -> (Option<u32>, Option<String>) {
+    let Some(hotkey) = global_hotkey(chord) else {
+        return (None, Some("shortcut".to_string()));
+    };
+    let id = hotkey.id();
+    match manager.register(hotkey) {
+        Ok(()) => (Some(id), None),
+        Err(err) => (None, Some(err.to_string())),
+    }
+}
+
+fn global_hotkey(chord: Chord) -> Option<HotKey> {
+    let mut mods = Modifiers::empty();
+    if chord.ctrl {
+        mods |= Modifiers::CONTROL;
+    }
+    if chord.alt {
+        mods |= Modifiers::ALT;
+    }
+    if chord.shift {
+        mods |= Modifiers::SHIFT;
+    }
+    if chord.win {
+        mods |= Modifiers::META;
+    }
+    if mods.is_empty() {
+        return None;
+    }
+    Some(HotKey::new(Some(mods), hotkey_code(chord.key)?))
+}
+
+fn hotkey_code(key: KeyName) -> Option<Code> {
+    Some(match key {
+        KeyName::Letter(letter) => match letter.to_ascii_lowercase() {
+            'a' => Code::KeyA,
+            'b' => Code::KeyB,
+            'c' => Code::KeyC,
+            'd' => Code::KeyD,
+            'e' => Code::KeyE,
+            'f' => Code::KeyF,
+            'g' => Code::KeyG,
+            'h' => Code::KeyH,
+            'i' => Code::KeyI,
+            'j' => Code::KeyJ,
+            'k' => Code::KeyK,
+            'l' => Code::KeyL,
+            'm' => Code::KeyM,
+            'n' => Code::KeyN,
+            'o' => Code::KeyO,
+            'p' => Code::KeyP,
+            'q' => Code::KeyQ,
+            'r' => Code::KeyR,
+            's' => Code::KeyS,
+            't' => Code::KeyT,
+            'u' => Code::KeyU,
+            'v' => Code::KeyV,
+            'w' => Code::KeyW,
+            'x' => Code::KeyX,
+            'y' => Code::KeyY,
+            'z' => Code::KeyZ,
+            _ => return None,
+        },
+        KeyName::Digit(0) => Code::Digit0,
+        KeyName::Digit(1) => Code::Digit1,
+        KeyName::Digit(2) => Code::Digit2,
+        KeyName::Digit(3) => Code::Digit3,
+        KeyName::Digit(4) => Code::Digit4,
+        KeyName::Digit(5) => Code::Digit5,
+        KeyName::Digit(6) => Code::Digit6,
+        KeyName::Digit(7) => Code::Digit7,
+        KeyName::Digit(8) => Code::Digit8,
+        KeyName::Digit(9) => Code::Digit9,
+        KeyName::Digit(_) => return None,
+        KeyName::Function(1) => Code::F1,
+        KeyName::Function(2) => Code::F2,
+        KeyName::Function(3) => Code::F3,
+        KeyName::Function(4) => Code::F4,
+        KeyName::Function(5) => Code::F5,
+        KeyName::Function(6) => Code::F6,
+        KeyName::Function(7) => Code::F7,
+        KeyName::Function(8) => Code::F8,
+        KeyName::Function(9) => Code::F9,
+        KeyName::Function(10) => Code::F10,
+        KeyName::Function(11) => Code::F11,
+        KeyName::Function(12) => Code::F12,
+        KeyName::Function(_) => return None,
+        KeyName::Space => Code::Space,
+        KeyName::Tab => Code::Tab,
+        KeyName::Up => Code::ArrowUp,
+        KeyName::Down => Code::ArrowDown,
+        KeyName::Left => Code::ArrowLeft,
+        KeyName::Right => Code::ArrowRight,
+        KeyName::Esc => Code::Escape,
     })
 }
 
@@ -2234,6 +2966,43 @@ fn button_icons(language: Language) -> &'static [Option<ButtonIcon>; 5] {
             }
         })
     })
+}
+
+fn edit_icon(language: Language) -> Option<&'static ButtonIcon> {
+    static ICON: OnceLock<Option<ButtonIcon>> = OnceLock::new();
+    ICON.get_or_init(|| match decode_button_icon(include_bytes!("icons/edit.png")) {
+        Some(icon) => Some(icon),
+        None => {
+            eprintln!(
+                "{}",
+                language::render(language, language::BUTTON_ICON_FAILED, &[("err", "invalid image")])
+            );
+            None
+        }
+    })
+    .as_ref()
+}
+
+fn hotkey_actions() -> [HotkeyAction; 6] {
+    [
+        HotkeyAction::Capture,
+        HotkeyAction::Inclusive,
+        HotkeyAction::Refresh,
+        HotkeyAction::Frame,
+        HotkeyAction::Again,
+        HotkeyAction::Close,
+    ]
+}
+
+fn hotkey_phrase(action: HotkeyAction) -> language::Phrase {
+    match action {
+        HotkeyAction::Capture => language::TRAY_NEW,
+        HotkeyAction::Inclusive => language::HOTKEY_INCLUSIVE,
+        HotkeyAction::Refresh => language::STRIP_REFRESH,
+        HotkeyAction::Frame => language::HOTKEY_FRAME,
+        HotkeyAction::Again => language::HOTKEY_AGAIN,
+        HotkeyAction::Close => language::HOTKEY_CLOSE,
+    }
 }
 
 fn lock_icons(language: Language) -> &'static [Option<ButtonIcon>; 2] {

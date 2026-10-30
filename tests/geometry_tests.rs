@@ -1,6 +1,8 @@
 use screenpatch::core::geometry::{
     capture_rect_for_monitor, frame_byte_len, global_to_monitor_local, help_line_top,
-    help_window_origin, index_containing_point, logical_window_size, place_window,
+    help_window_origin, hotkey_capture_origin, hotkey_change_button, hotkey_change_hit, hotkey_list_origin,
+    hotkey_row_at, hotkey_row_button, index_containing_point,
+    logical_window_size, place_window,
     select_monitor_pair, CaptureRect, LogicalRect, MonitorCandidate, PatchGeometry, WorkArea,
     HELP_CLIENT_HEIGHT, HELP_CLIENT_WIDTH, HELP_LINE_HEIGHT, HELP_PAD_X, HELP_PAD_Y,
     MAX_FRAME_BYTES,
@@ -238,6 +240,14 @@ fn help_window_is_centered_on_the_work_area() {
         height: 1080,
     };
     assert_eq!(help_window_origin(wide), (680, 310));
+    assert_eq!(hotkey_list_origin(wide), (720, 404));
+    assert_eq!(hotkey_capture_origin(wide), (780, 470));
+    assert_eq!(hotkey_row_button(0), Some((434, 21, 30, 30)));
+    assert_eq!(hotkey_row_at(449, 36), Some(0));
+    assert_eq!(hotkey_row_at(434, 21), None);
+    assert_eq!(hotkey_change_button(), (120, 92, 120, 32));
+    assert!(hotkey_change_hit(120, 92));
+    assert!(!hotkey_change_hit(119, 92));
     let narrow = WorkArea {
         x: 10,
         y: 20,

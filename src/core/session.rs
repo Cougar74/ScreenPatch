@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::core::hotkeys::{format_hotkeys, hotkey_rejection, parse_hotkeys, Chord, HotkeyAction, Hotkeys};
 use crate::core::language::{self, Language};
 use crate::core::model::{
     default_policy, frame_accepted, CaptureFrame, CapturePolicy, CaptureSource, CaptureView, ShownFrame,
@@ -19,6 +20,7 @@ pub struct HeldCapture {
 
 pub struct Session<P: PlatformPort> {
     language: Language,
+    hotkeys: Hotkeys,
     next_number: u64,
     captures: Vec<HeldCapture>,
     policy: CapturePolicy,
@@ -44,6 +46,7 @@ pub enum Request<W> {
     Save { number: u64, path: PathBuf },
     Close { number: u64 },
     LanguageChosen { language: Language },
+    HotkeyChosen { action: HotkeyAction, chord: Chord },
 }
 
 #[derive(Debug, PartialEq)]
@@ -57,6 +60,8 @@ pub enum Outcome {
     Ignored,
     Closed,
     LanguageSaved { message: Option<String> },
+    HotkeySaved,
+    HotkeyFailed { message: String },
     CopySucceeded,
     CopyFailed { message: String },
     SaveSucceeded,
@@ -64,7 +69,7 @@ pub enum Outcome {
 }
 
 impl<P: PlatformPort> Session<P> {
-    pub fn open(port: &P) -> (Self, Option<String>) {
+    pub fn open(port: &P) -> (Self, Option<String>, Option<String>) {
         let (language, message) = match port.read_language() {
             Ok(Some(language)) => (language, None),
             Ok(None) => (port.system_language(), None),
@@ -80,20 +85,38 @@ impl<P: PlatformPort> Session<P> {
                 )
             }
         };
+        let (hotkeys, hotkey_message) = match port.read_hotkeys() {
+            Ok(Some(text)) => (parse_hotkeys(&text), None),
+            Ok(None) => (Hotkeys::default(), None),
+            Err(err) => (
+                Hotkeys::default(),
+                Some(language::render(
+                    language,
+                    language::HOTKEY_READ_FAILED,
+                    &[("err", &err)],
+                )),
+            ),
+        };
         (
             Self {
                 language,
+                hotkeys,
                 next_number: 1,
                 captures: Vec::new(),
                 policy: default_policy(),
                 port: std::marker::PhantomData,
             },
             message,
+            hotkey_message,
         )
     }
 
     pub fn language(&self) -> Language {
         self.language
+    }
+
+    pub fn hotkeys(&self) -> &Hotkeys {
+        &self.hotkeys
     }
 
     pub fn capture(&self, number: u64) -> Option<&HeldCapture> {
@@ -199,6 +222,27 @@ impl<P: PlatformPort> Session<P> {
                             language::LANGUAGE_SAVE_FAILED,
                             &[("err", &err)],
                         )),
+                    },
+                }
+            }
+            Request::HotkeyChosen { action, chord } => {
+                if hotkey_rejection(&self.hotkeys, action, chord).is_some() {
+                    return Outcome::Ignored;
+                }
+                let mut next = self.hotkeys;
+                next.assign(action, chord);
+                let text = format_hotkeys(&next);
+                match port.write_hotkeys(&text) {
+                    Ok(()) => {
+                        self.hotkeys = next;
+                        Outcome::HotkeySaved
+                    }
+                    Err(err) => Outcome::HotkeyFailed {
+                        message: language::render(
+                            self.language,
+                            language::HOTKEY_WRITE_FAILED,
+                            &[("err", &err)],
+                        ),
                     },
                 }
             }

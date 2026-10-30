@@ -1,5 +1,6 @@
 pub mod commands;
 pub mod geometry;
+pub mod hotkeys;
 pub mod language;
 pub mod model;
 pub mod patches;

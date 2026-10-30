@@ -33,60 +33,6 @@ pub fn parse_saved_language(text: &str) -> Option<Language> {
     }
 }
 
-const HELP_LINES_RU: [&str; 15] = [
-    "Горячие клавиши",
-    "Ctrl+Shift+S — новый снимок",
-    "Ctrl+Alt+Shift+S — снимок с окнами программы",
-    "  ",
-    "В окне снимка",
-    "R — обновить",
-    "1 — размер кадра",
-    "S — новый снимок",
-    "Esc — закрыть снимок",
-    "  ",
-    "Мышь",
-    "Правый клик — показать или скрыть кнопки, слайдер и замок",
-    "Перетаскивание — двигать окно",
-    "Замок — закрепить положение и размер",
-    "Слайдер — прозрачность картинки",
-];
-
-const HELP_LINES_EN: [&str; 15] = [
-    "Hotkeys",
-    "Ctrl+Shift+S — new capture",
-    "Ctrl+Alt+Shift+S — capture with the app windows",
-    "  ",
-    "In a capture window",
-    "R — refresh",
-    "1 — frame size",
-    "S — new capture",
-    "Esc — close the capture",
-    "  ",
-    "Mouse",
-    "Right-click — show or hide the buttons, the slider, and the lock",
-    "Drag — move the window",
-    "Lock — pin position and size",
-    "Slider — picture opacity",
-];
-
-pub fn help_lines(language: Language) -> &'static [&'static str; 15] {
-    match language {
-        Language::Ru => &HELP_LINES_RU,
-        Language::En => &HELP_LINES_EN,
-    }
-}
-
-pub fn help_key(line: &str) -> Option<&str> {
-    for key in ["Ctrl+Alt+Shift+S", "Ctrl+Shift+S", "Esc", "R", "S", "1"] {
-        if let Some(rest) = line.strip_prefix(key) {
-            if rest.starts_with(" — ") {
-                return Some(key);
-            }
-        }
-    }
-    None
-}
-
 pub fn language_choice(current: Language, picked: Language) -> Option<Language> {
     if current == picked {
         None
@@ -101,6 +47,34 @@ pub const TRAY_HIDE: Phrase = Phrase { ru: "Скрыть все", en: "Hide all"
 pub const TRAY_CLOSE_ALL: Phrase = Phrase { ru: "Закрыть все снимки", en: "Close all captures" };
 pub const TRAY_LANGUAGE: Phrase = Phrase { ru: "Язык", en: "Language" };
 pub const TRAY_HELP: Phrase = Phrase { ru: "Справка", en: "Help" };
+pub const TRAY_HOTKEYS: Phrase = Phrase { ru: "Сочетания", en: "Shortcuts" };
+pub const HOTKEY_CHANGE: Phrase = Phrase { ru: "Изменить", en: "Change" };
+pub const HOTKEY_INCOMPLETE: Phrase = Phrase {
+    ru: "Сочетание не закончено.",
+    en: "The shortcut is incomplete.",
+};
+pub const HOTKEY_NEEDS_MODIFIER: Phrase = Phrase {
+    ru: "Глобальному сочетанию нужен Ctrl, Alt, Shift или Win.",
+    en: "A global shortcut needs Ctrl, Alt, Shift, or Win.",
+};
+pub const HOTKEY_DUPLICATE: Phrase = Phrase {
+    ru: "Это сочетание уже занято: {action}.",
+    en: "This shortcut is already used by {action}.",
+};
+pub const HOTKEY_REGISTER_FAILED: Phrase = Phrase {
+    ru: "Система не отдала это сочетание.",
+    en: "The system did not accept this shortcut.",
+};
+pub const HOTKEY_INCLUSIVE: Phrase = Phrase {
+    ru: "Снимок с окнами программы",
+    en: "Capture with the app windows",
+};
+pub const HOTKEY_FRAME: Phrase = Phrase { ru: "Размер кадра", en: "Frame size" };
+pub const HOTKEY_AGAIN: Phrase = Phrase {
+    ru: "Новый снимок из окна",
+    en: "New capture from the window",
+};
+pub const HOTKEY_CLOSE: Phrase = Phrase { ru: "Закрыть снимок", en: "Close the capture" };
 pub const LANGUAGE_NAME_RU: &str = "Русский";
 pub const LANGUAGE_NAME_EN: &str = "English";
 pub const TRAY_EXIT: Phrase = Phrase { ru: "Выход", en: "Exit" };
@@ -234,6 +208,14 @@ pub const LANGUAGE_READ_FAILED: Phrase = Phrase {
 pub const LANGUAGE_SAVE_FAILED: Phrase = Phrase {
     ru: "не удалось запомнить язык: {err}",
     en: "could not save the language choice: {err}",
+};
+pub const HOTKEY_READ_FAILED: Phrase = Phrase {
+    ru: "не удалось прочитать сочетания: {err}",
+    en: "could not read the shortcuts: {err}",
+};
+pub const HOTKEY_WRITE_FAILED: Phrase = Phrase {
+    ru: "Не удалось записать сочетания: {err}.",
+    en: "Could not save the shortcuts: {err}.",
 };
 pub const NO_MONITORS: Phrase = Phrase { ru: "мониторы не найдены", en: "no monitors were found" };
 pub const MONITORS_NOT_FOUND: Phrase = Phrase {

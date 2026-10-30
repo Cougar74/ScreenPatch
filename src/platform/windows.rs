@@ -12,9 +12,9 @@ use windows::Win32::Graphics::Gdi::{
     CreateCompatibleDC, CreateDIBSection, CreateFontW, CreateRoundRectRgn, DeleteDC, DeleteObject, DrawTextW,
     EnumDisplayMonitors, GetDC, GetMonitorInfoW, GetTextExtentPoint32W, ReleaseDC, SelectObject, SetBkMode,
     SetTextColor, SetWindowRgn, AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION,
-    CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS, DT_LEFT,
-    DT_NOPREFIX, DT_SINGLELINE, DT_TOP, FF_DONTCARE, FW_BOLD, FW_NORMAL, OUT_DEFAULT_PRECIS, HDC, HFONT,
-    HGDIOBJ, HMONITOR, MONITORINFO, TRANSPARENT,
+    CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS, DT_CENTER,
+    DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_TOP, DT_VCENTER, DT_WORDBREAK, FF_DONTCARE, FW_BOLD,
+    FW_NORMAL, OUT_DEFAULT_PRECIS, HDC, HFONT, HGDIOBJ, HMONITOR, MONITORINFO, TRANSPARENT,
 };
 use windows::Win32::Globalization::GetUserDefaultUILanguage;
 use windows::Win32::System::SystemInformation::GetLocalTime;
@@ -33,11 +33,13 @@ use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use xcap::Monitor;
 
 use crate::capture::service::{frame_from_rgba, CaptureError};
+use crate::core::commands::{blend_pixel, point_in_rounded_rect, sample_icon, ButtonIcon};
 use crate::core::geometry::{
-    help_line_top, logical_to_physical_px, physical_to_logical_px, CaptureRect, WorkArea,
-    HELP_LINE_HEIGHT, HELP_PAD_X,
+    help_line_top, hotkey_change_button, hotkey_row_button, logical_to_physical_px, physical_to_logical_px,
+    CaptureRect, WorkArea, HELP_LINE_HEIGHT, HELP_PAD_X,
 };
-use crate::core::language::{self, help_key, Language};
+use crate::core::hotkeys::help_key;
+use crate::core::language::{self, Language};
 use crate::core::refresh::{ImageFrame, Fingerprint};
 
 #[derive(Clone, Debug)]
@@ -455,6 +457,25 @@ pub fn write_saved_language(language: Language) -> Result<(), String> {
     std::fs::write(folder.join("language.txt"), word).map_err(|err| err.to_string())
 }
 
+pub fn read_saved_hotkeys() -> Result<Option<String>, String> {
+    let Some(root) = std::env::var_os("LOCALAPPDATA") else {
+        return Err("LOCALAPPDATA".to_string());
+    };
+    let path = PathBuf::from(root).join("ScreenPatch").join("hotkeys.txt");
+    match std::fs::read_to_string(&path) {
+        Ok(text) => Ok(Some(text)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+pub fn write_saved_hotkeys(text: &str) -> Result<(), String> {
+    let root = std::env::var_os("LOCALAPPDATA").ok_or_else(|| "LOCALAPPDATA".to_string())?;
+    let folder = PathBuf::from(root).join("ScreenPatch");
+    std::fs::create_dir_all(&folder).map_err(|err| err.to_string())?;
+    std::fs::write(folder.join("hotkeys.txt"), text).map_err(|err| err.to_string())
+}
+
 pub fn acquire_single_instance(language: Language) -> bool {
     static INSTANCE_LOCK: OnceLock<isize> = OnceLock::new();
     unsafe {
@@ -557,6 +578,266 @@ pub fn paint_help(width: u32, height: u32, scale: f64, lines: &[&str; 15]) -> Ve
     }
     unsafe { draw_help_lines(&mut rgba, width, height, scale, lines) };
     rgba
+}
+
+pub fn paint_hotkey_list(
+    width: u32,
+    height: u32,
+    scale: f64,
+    rows: &[&str; 6],
+    pressed: Option<usize>,
+    icon: Option<&ButtonIcon>,
+) -> Vec<u8> {
+    let mut rgba = vec![24u8, 24, 24, 255].repeat((width as usize).saturating_mul(height as usize));
+    if width == 0 || height == 0 {
+        return rgba;
+    }
+    unsafe {
+        with_text_dib(&mut rgba, width, height, |dc, bgra| {
+            for index in 0..6 {
+                let Some((left, top, button_w, button_h)) = hotkey_row_button(index) else {
+                    continue;
+                };
+                let fill = if pressed == Some(index) {
+                    [14, 14, 14, 255]
+                } else {
+                    [32, 32, 32, 255]
+                };
+                fill_round_bgra(bgra, width, height, scale, left, top, button_w, button_h, 15, fill);
+                let font = text_font(dc, scale, 16, false);
+                let mut bounds = RECT {
+                    left: logical_px(16, scale),
+                    top: logical_px(16 + i32::try_from(index).unwrap_or(0) * 40, scale),
+                    right: logical_px(left - 8, scale),
+                    bottom: logical_px(16 + i32::try_from(index).unwrap_or(0) * 40 + 40, scale),
+                };
+                draw_text_box(dc, rows[index], &mut bounds, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+                drop_font(dc, font);
+            }
+        });
+    }
+    for index in 0..6 {
+        let Some((left, top, button_w, button_h)) = hotkey_row_button(index) else {
+            continue;
+        };
+        blit_scaled_icon(&mut rgba, width, height, scale, left, top, button_w, button_h, icon);
+    }
+    rgba
+}
+
+pub fn paint_hotkey_capture(
+    width: u32,
+    height: u32,
+    scale: f64,
+    text: &str,
+    button: &str,
+    pressed: bool,
+) -> Vec<u8> {
+    let mut rgba = vec![24u8, 24, 24, 255].repeat((width as usize).saturating_mul(height as usize));
+    if width == 0 || height == 0 {
+        return rgba;
+    }
+    let (left, top, button_w, button_h) = hotkey_change_button();
+    unsafe {
+        with_text_dib(&mut rgba, width, height, |dc, bgra| {
+            let fill = if pressed { [14, 14, 14, 255] } else { [32, 32, 32, 255] };
+            fill_round_bgra(bgra, width, height, scale, left, top, button_w, button_h, 8, fill);
+            let title_font = text_font(dc, scale, 28, false);
+            let mut title = RECT {
+                left: logical_px(16, scale),
+                top: 0,
+                right: width as i32 - logical_px(16, scale),
+                bottom: logical_px(92, scale),
+            };
+            let format = if text.chars().count() > 24 {
+                DT_CENTER | DT_VCENTER | DT_WORDBREAK | DT_NOPREFIX
+            } else {
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX
+            };
+            draw_text_box(dc, text, &mut title, format);
+            drop_font(dc, title_font);
+            let button_font = text_font(dc, scale, 16, false);
+            let mut label = RECT {
+                left: logical_px(left, scale),
+                top: logical_px(top, scale),
+                right: logical_px(left + i32::try_from(button_w).unwrap_or(0), scale),
+                bottom: logical_px(top + i32::try_from(button_h).unwrap_or(0), scale),
+            };
+            draw_text_box(dc, button, &mut label, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+            drop_font(dc, button_font);
+        });
+    }
+    rgba
+}
+
+fn logical_px(value: i32, scale: f64) -> i32 {
+    logical_to_physical_px(value, scale).unwrap_or(0)
+}
+
+fn fill_round_bgra(
+    pixels: &mut [u8],
+    width: u32,
+    height: u32,
+    scale: f64,
+    left: i32,
+    top: i32,
+    button_w: u32,
+    button_h: u32,
+    radius: i32,
+    color: [u8; 4],
+) {
+    let left = logical_px(left, scale);
+    let top = logical_px(top, scale);
+    let button_w = u32::try_from(logical_px(i32::try_from(button_w).unwrap_or(0), scale)).unwrap_or(0);
+    let button_h = u32::try_from(logical_px(i32::try_from(button_h).unwrap_or(0), scale)).unwrap_or(0);
+    let radius = logical_px(radius, scale).max(1);
+    let right = left.saturating_add(i32::try_from(button_w).unwrap_or(0));
+    let bottom = top.saturating_add(i32::try_from(button_h).unwrap_or(0));
+    for y in top..bottom {
+        for x in left..right {
+            if point_in_rounded_rect(x, y, left, top, button_w, button_h, radius) {
+                put_bgra(pixels, width, height, x, y, color);
+            }
+        }
+    }
+}
+
+fn put_bgra(pixels: &mut [u8], width: u32, height: u32, x: i32, y: i32, color: [u8; 4]) {
+    if x < 0 || y < 0 {
+        return;
+    }
+    let Ok(x) = u32::try_from(x) else {
+        return;
+    };
+    let Ok(y) = u32::try_from(y) else {
+        return;
+    };
+    if x >= width || y >= height {
+        return;
+    }
+    let index = ((y * width + x) * 4) as usize;
+    if index + 4 > pixels.len() {
+        return;
+    }
+    pixels[index] = color[2];
+    pixels[index + 1] = color[1];
+    pixels[index + 2] = color[0];
+    pixels[index + 3] = color[3];
+}
+
+fn blit_scaled_icon(
+    pixels: &mut [u8],
+    width: u32,
+    height: u32,
+    scale: f64,
+    left: i32,
+    top: i32,
+    button_w: u32,
+    button_h: u32,
+    icon: Option<&ButtonIcon>,
+) {
+    let Some(icon) = icon else {
+        return;
+    };
+    if icon.width == 0 || icon.height == 0 {
+        return;
+    }
+    let left = logical_px(left, scale);
+    let top = logical_px(top, scale);
+    let button_w = logical_px(i32::try_from(button_w).unwrap_or(0), scale);
+    let button_h = logical_px(i32::try_from(button_h).unwrap_or(0), scale);
+    let icon_w = u32::try_from(logical_px(16, scale).max(1)).unwrap_or(1);
+    let icon_h = icon_w;
+    let icon_left = left + (button_w - icon_w as i32) / 2;
+    let icon_top = top + (button_h - icon_h as i32) / 2;
+    for y in 0..icon_h {
+        for x in 0..icon_w {
+            blend_pixel(
+                pixels,
+                width,
+                height,
+                icon_left + i32::try_from(x).unwrap_or(0),
+                icon_top + i32::try_from(y).unwrap_or(0),
+                sample_icon(icon, x, y, icon_w, icon_h),
+            );
+        }
+    }
+}
+
+unsafe fn with_text_dib(rgba: &mut [u8], width: u32, height: u32, draw: impl FnOnce(HDC, &mut [u8])) {
+    let dc = CreateCompatibleDC(None);
+    if dc.is_invalid() {
+        return;
+    }
+    let info = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: width as i32,
+            biHeight: -(height as i32),
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut bits: *mut c_void = std::ptr::null_mut();
+    let bitmap = CreateDIBSection(Some(dc), &info, DIB_RGB_COLORS, &mut bits, None, 0);
+    if bitmap.is_err() || bits.is_null() {
+        let _ = DeleteDC(dc);
+        return;
+    }
+    let bitmap = bitmap.unwrap_or_default();
+    let bitmap_object = HGDIOBJ::from(bitmap);
+    let previous = SelectObject(dc, bitmap_object);
+    let count = (width as usize).saturating_mul(height as usize).saturating_mul(4);
+    let source = std::slice::from_raw_parts_mut(bits as *mut u8, count.min(rgba.len()));
+    for pixel in source.chunks_exact_mut(4) {
+        pixel.copy_from_slice(&[24, 24, 24, 255]);
+    }
+    let _ = SetBkMode(dc, TRANSPARENT);
+    let _ = SetTextColor(dc, COLORREF(0x00FF_FFFF));
+    draw(dc, source);
+    for (rgba_pixel, bgra) in rgba.chunks_exact_mut(4).zip(source.chunks_exact(4)) {
+        rgba_pixel[0] = bgra[2];
+        rgba_pixel[1] = bgra[1];
+        rgba_pixel[2] = bgra[0];
+        rgba_pixel[3] = 255;
+    }
+    let _ = SelectObject(dc, previous);
+    let _ = DeleteObject(bitmap_object);
+    let _ = DeleteDC(dc);
+}
+
+unsafe fn text_font(dc: HDC, scale: f64, logical: i32, bold: bool) -> HGDIOBJ {
+    let font_height = -logical_px(logical, scale);
+    let weight = if bold { FW_BOLD.0 as i32 } else { FW_NORMAL.0 as i32 };
+    let font = help_font(font_height, weight);
+    if font.is_invalid() {
+        return HGDIOBJ::default();
+    }
+    let font_object = HGDIOBJ::from(font);
+    let _ = SelectObject(dc, font_object);
+    font_object
+}
+
+unsafe fn drop_font(dc: HDC, font: HGDIOBJ) {
+    if font.is_invalid() {
+        return;
+    }
+    let _ = SelectObject(dc, HGDIOBJ::default());
+    let _ = DeleteObject(font);
+    let _ = dc;
+}
+
+unsafe fn draw_text_box(
+    dc: HDC,
+    text: &str,
+    bounds: &mut RECT,
+    format: windows::Win32::Graphics::Gdi::DRAW_TEXT_FORMAT,
+) {
+    let mut wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    let _ = DrawTextW(dc, &mut wide, bounds, format);
 }
 
 pub fn measure_tooltip_text(scale: f64, text: &str) -> Option<(i32, i32)> {

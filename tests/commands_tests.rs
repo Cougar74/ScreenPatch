@@ -212,7 +212,16 @@ fn decode_button_icon_rejects_bytes_that_are_not_an_image() {
 
 #[test]
 fn button_icon_files_are_transparent_white_glyphs() {
-    for name in ["refresh.png", "before-after.png", "copy.png", "save.png", "close.png", "lock-open.png", "lock-closed.png"] {
+    for name in [
+        "refresh.png",
+        "before-after.png",
+        "copy.png",
+        "save.png",
+        "close.png",
+        "lock-open.png",
+        "lock-closed.png",
+        "edit.png",
+    ] {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("src/icons")
             .join(name);
