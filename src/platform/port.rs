@@ -9,8 +9,8 @@ use crate::core::language::{self, Language};
 use crate::core::port::PlatformPort;
 use crate::core::refresh::Fingerprint;
 use super::windows::{
-    capture_monitor_region, list_displays, read_saved_language, system_ui_language, wait_until_hidden,
-    write_saved_hotkeys, write_saved_language, Hwnd,
+    capture_monitor_region, list_displays,     read_saved_autocopy, read_saved_language, system_ui_language, wait_until_hidden,
+    write_saved_autocopy, write_saved_hotkeys, write_saved_language, Hwnd,
 };
 
 pub struct WindowsPlatform {
@@ -80,6 +80,14 @@ impl PlatformPort for WindowsPlatform {
 
     fn write_hotkeys(&mut self, text: &str) -> Result<(), String> {
         write_saved_hotkeys(text)
+    }
+
+    fn read_autocopy(&self) -> Result<Option<String>, String> {
+        read_saved_autocopy()
+    }
+
+    fn write_autocopy(&mut self, text: &str) -> Result<(), String> {
+        write_saved_autocopy(text)
     }
 
     fn monitors(&self) -> Result<Vec<Fingerprint>, String> {

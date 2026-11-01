@@ -14,6 +14,8 @@ pub trait PlatformPort {
     fn write_language(&mut self, language: Language) -> Result<(), String>;
     fn read_hotkeys(&self) -> Result<Option<String>, String>;
     fn write_hotkeys(&mut self, text: &str) -> Result<(), String>;
+    fn read_autocopy(&self) -> Result<Option<String>, String>;
+    fn write_autocopy(&mut self, text: &str) -> Result<(), String>;
     fn monitors(&self) -> Result<Vec<Fingerprint>, String>;
     fn snapshot(&mut self, hide: &[Self::Window]) -> Result<Vec<(Fingerprint, Vec<u8>)>, String>;
     fn capture_region(

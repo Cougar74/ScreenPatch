@@ -21,6 +21,7 @@ pub struct HeldCapture {
 pub struct Session<P: PlatformPort> {
     language: Language,
     hotkeys: Hotkeys,
+    auto_copy: bool,
     next_number: u64,
     captures: Vec<HeldCapture>,
     policy: CapturePolicy,
@@ -47,13 +48,14 @@ pub enum Request<W> {
     Close { number: u64 },
     LanguageChosen { language: Language },
     HotkeyChosen { action: HotkeyAction, chord: Chord },
+    AutoCopyChosen { enabled: bool },
 }
 
 #[derive(Debug, PartialEq)]
 pub enum Outcome {
     SnapshotSucceeded { monitors: Vec<(crate::core::refresh::Fingerprint, Vec<u8>, u32, u32)> },
     SnapshotFailed { message: String },
-    CaptureSucceeded { number: u64 },
+    CaptureSucceeded { number: u64, copy_error: Option<String> },
     CaptureFailed { message: String },
     SourceUnavailable { message: String },
     ViewUpdated,
@@ -62,6 +64,7 @@ pub enum Outcome {
     LanguageSaved { message: Option<String> },
     HotkeySaved,
     HotkeyFailed { message: String },
+    AutoCopySaved { message: Option<String> },
     CopySucceeded,
     CopyFailed { message: String },
     SaveSucceeded,
@@ -69,7 +72,7 @@ pub enum Outcome {
 }
 
 impl<P: PlatformPort> Session<P> {
-    pub fn open(port: &P) -> (Self, Option<String>, Option<String>) {
+    pub fn open(port: &P) -> (Self, Option<String>, Option<String>, Option<String>) {
         let (language, message) = match port.read_language() {
             Ok(Some(language)) => (language, None),
             Ok(None) => (port.system_language(), None),
@@ -97,10 +100,23 @@ impl<P: PlatformPort> Session<P> {
                 )),
             ),
         };
+        let (auto_copy, autocopy_message) = match port.read_autocopy() {
+            Ok(Some(text)) => (language::parse_saved_autocopy(&text), None),
+            Ok(None) => (false, None),
+            Err(err) => (
+                false,
+                Some(language::render(
+                    language,
+                    language::AUTO_COPY_READ_FAILED,
+                    &[("err", &err)],
+                )),
+            ),
+        };
         (
             Self {
                 language,
                 hotkeys,
+                auto_copy,
                 next_number: 1,
                 captures: Vec::new(),
                 policy: default_policy(),
@@ -108,6 +124,7 @@ impl<P: PlatformPort> Session<P> {
             },
             message,
             hotkey_message,
+            autocopy_message,
         )
     }
 
@@ -117,6 +134,10 @@ impl<P: PlatformPort> Session<P> {
 
     pub fn hotkeys(&self) -> &Hotkeys {
         &self.hotkeys
+    }
+
+    pub fn auto_copy(&self) -> bool {
+        self.auto_copy
     }
 
     pub fn capture(&self, number: u64) -> Option<&HeldCapture> {
@@ -246,12 +267,25 @@ impl<P: PlatformPort> Session<P> {
                     },
                 }
             }
+            Request::AutoCopyChosen { enabled } => {
+                self.auto_copy = enabled;
+                match port.write_autocopy(language::format_saved_autocopy(enabled)) {
+                    Ok(()) => Outcome::AutoCopySaved { message: None },
+                    Err(err) => Outcome::AutoCopySaved {
+                        message: Some(language::render(
+                            self.language,
+                            language::AUTO_COPY_SAVE_FAILED,
+                            &[("err", &err)],
+                        )),
+                    },
+                }
+            }
         }
     }
 
     fn capture_new(
         &mut self,
-        port: &P,
+        port: &mut P,
         source: CaptureSource,
         x: i32,
         y: i32,
@@ -287,11 +321,12 @@ impl<P: PlatformPort> Session<P> {
         }
         let number = self.next_number;
         self.next_number += 1;
+        let pixels = Arc::from(pixels);
         self.captures.push(HeldCapture {
             number,
             source: source.clone(),
             current: CaptureFrame {
-                pixels: Arc::from(pixels),
+                pixels: Arc::clone(&pixels),
                 width: frame_width,
                 height: frame_height,
                 captured_at: port.now(),
@@ -308,7 +343,15 @@ impl<P: PlatformPort> Session<P> {
                 shown: ShownFrame::Current,
             },
         });
-        Outcome::CaptureSucceeded { number }
+        let copy_error = if self.auto_copy {
+            match port.copy_image(&pixels, frame_width, frame_height) {
+                Ok(()) => None,
+                Err(err) => Some(self.io_failed(language::COPY_FAILED, number, &err)),
+            }
+        } else {
+            None
+        };
+        Outcome::CaptureSucceeded { number, copy_error }
     }
 
     fn capture_refresh(&mut self, port: &mut P, number: u64, hide: &[P::Window]) -> Outcome {
@@ -394,7 +437,7 @@ impl<P: PlatformPort> Session<P> {
             source,
         };
         self.captures[index].view.shown = ShownFrame::Current;
-        Outcome::CaptureSucceeded { number }
+        Outcome::CaptureSucceeded { number, copy_error: None }
     }
 
     fn shown(&self, number: u64) -> Option<&CaptureFrame> {

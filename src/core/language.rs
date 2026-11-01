@@ -33,6 +33,14 @@ pub fn parse_saved_language(text: &str) -> Option<Language> {
     }
 }
 
+pub fn parse_saved_autocopy(text: &str) -> bool {
+    text.trim() == "on"
+}
+
+pub fn format_saved_autocopy(enabled: bool) -> &'static str {
+    if enabled { "on\n" } else { "off\n" }
+}
+
 pub fn language_choice(current: Language, picked: Language) -> Option<Language> {
     if current == picked {
         None
@@ -42,6 +50,10 @@ pub fn language_choice(current: Language, picked: Language) -> Option<Language> 
 }
 
 pub const TRAY_NEW: Phrase = Phrase { ru: "Новый снимок", en: "New capture" };
+pub const TRAY_AUTOCOPY: Phrase = Phrase {
+    ru: "Копировать новые снимки",
+    en: "Copy new captures",
+};
 pub const TRAY_SHOW: Phrase = Phrase { ru: "Показать все", en: "Show all" };
 pub const TRAY_HIDE: Phrase = Phrase { ru: "Скрыть все", en: "Hide all" };
 pub const TRAY_CLOSE_ALL: Phrase = Phrase { ru: "Закрыть все снимки", en: "Close all captures" };
@@ -208,6 +220,14 @@ pub const LANGUAGE_READ_FAILED: Phrase = Phrase {
 pub const LANGUAGE_SAVE_FAILED: Phrase = Phrase {
     ru: "не удалось запомнить язык: {err}",
     en: "could not save the language choice: {err}",
+};
+pub const AUTO_COPY_READ_FAILED: Phrase = Phrase {
+    ru: "не удалось прочитать автокопирование: {err}",
+    en: "could not read the automatic copy setting: {err}",
+};
+pub const AUTO_COPY_SAVE_FAILED: Phrase = Phrase {
+    ru: "не удалось запомнить автокопирование: {err}",
+    en: "could not save the automatic copy setting: {err}",
 };
 pub const HOTKEY_READ_FAILED: Phrase = Phrase {
     ru: "не удалось прочитать сочетания: {err}",

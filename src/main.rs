@@ -114,6 +114,7 @@ struct TrayMenus {
     language_menu: Submenu,
     russian: CheckMenuItem,
     english: CheckMenuItem,
+    autocopy: CheckMenuItem,
 }
 
 struct HelpWindow {
@@ -205,11 +206,14 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let mut port = WindowsPlatform::new(screenpatch::core::language::Language::En);
-    let (session, read_error, hotkey_error) = Session::open(&port);
+    let (session, read_error, hotkey_error, autocopy_error) = Session::open(&port);
     if let Some(message) = read_error {
         eprintln!("{message}");
     }
     if let Some(message) = hotkey_error {
+        eprintln!("{message}");
+    }
+    if let Some(message) = autocopy_error {
         eprintln!("{message}");
     }
     let language = session.language();
@@ -811,7 +815,12 @@ impl App {
                 pixels: frame.pixels.to_vec(),
             },
         ) {
-            Outcome::CaptureSucceeded { number } => number,
+            Outcome::CaptureSucceeded { number, copy_error } => {
+                if let Some(message) = copy_error {
+                    eprintln!("{message}");
+                }
+                number
+            }
             Outcome::CaptureFailed { message } => return Err(message),
             _ => return Err(self.say(language::FRAME_TOO_BIG).to_string()),
         };
@@ -1439,6 +1448,13 @@ impl App {
             self.language == Language::En,
             None,
         );
+        let autocopy = CheckMenuItem::with_id(
+            "autocopy",
+            self.say(language::TRAY_AUTOCOPY),
+            true,
+            self.session.auto_copy(),
+            None,
+        );
         let language_menu = Submenu::with_id_and_items(
             "language",
             self.say(language::TRAY_LANGUAGE),
@@ -1454,10 +1470,11 @@ impl App {
             &items[2],
             &items[3],
             &above,
-            &language_menu,
-            &items[4],
+            &autocopy,
             &items[5],
+            &language_menu,
             &below,
+            &items[4],
             &items[6],
         ];
         menu.append_items(&refs)
@@ -1469,6 +1486,7 @@ impl App {
                 language_menu,
                 russian,
                 english,
+                autocopy,
             },
         ))
     }
@@ -1480,6 +1498,20 @@ impl App {
         }
         self.tray_menus = Some(menus);
         Ok(())
+    }
+
+    fn toggle_autocopy(&mut self) {
+        let enabled = !self.session.auto_copy();
+        let outcome = self.session.handle(
+            &mut self.port,
+            Request::AutoCopyChosen { enabled },
+        );
+        if let Outcome::AutoCopySaved { message: Some(message) } = outcome {
+            eprintln!("{message}");
+        }
+        if let Some(menus) = &self.tray_menus {
+            menus.autocopy.set_checked(self.session.auto_copy());
+        }
     }
 
     fn choose_language(&mut self, picked: Language) {
@@ -1585,6 +1617,8 @@ impl App {
     fn menu_command(&mut self, event_loop: &ActiveEventLoop, id: &MenuId) {
         if id == "new" {
             self.begin_selection(event_loop, false);
+        } else if id == "autocopy" {
+            self.toggle_autocopy();
         } else if id == "show" {
             self.set_patch_visibility(true);
         } else if id == "hide" {

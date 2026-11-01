@@ -476,6 +476,25 @@ pub fn write_saved_hotkeys(text: &str) -> Result<(), String> {
     std::fs::write(folder.join("hotkeys.txt"), text).map_err(|err| err.to_string())
 }
 
+pub fn read_saved_autocopy() -> Result<Option<String>, String> {
+    let Some(root) = std::env::var_os("LOCALAPPDATA") else {
+        return Err("LOCALAPPDATA".to_string());
+    };
+    let path = PathBuf::from(root).join("ScreenPatch").join("autocopy.txt");
+    match std::fs::read_to_string(&path) {
+        Ok(text) => Ok(Some(text)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+pub fn write_saved_autocopy(text: &str) -> Result<(), String> {
+    let root = std::env::var_os("LOCALAPPDATA").ok_or_else(|| "LOCALAPPDATA".to_string())?;
+    let folder = PathBuf::from(root).join("ScreenPatch");
+    std::fs::create_dir_all(&folder).map_err(|err| err.to_string())?;
+    std::fs::write(folder.join("autocopy.txt"), text).map_err(|err| err.to_string())
+}
+
 pub fn acquire_single_instance(language: Language) -> bool {
     static INSTANCE_LOCK: OnceLock<isize> = OnceLock::new();
     unsafe {

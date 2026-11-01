@@ -4,7 +4,7 @@ use std::time::{Duration, SystemTime};
 use screenpatch::core::geometry::CaptureRect;
 use screenpatch::core::hotkeys::{format_hotkeys, Chord, HotkeyAction, Hotkeys, KeyName};
 use screenpatch::core::language::{
-    render, text, Language, FRAME_TOO_BIG, GEOMETRY_CHANGED, HOTKEY_READ_FAILED, HOTKEY_WRITE_FAILED,
+    render, text, Language, AUTO_COPY_READ_FAILED, AUTO_COPY_SAVE_FAILED, COPY_FAILED, FRAME_TOO_BIG, GEOMETRY_CHANGED, HOTKEY_READ_FAILED, HOTKEY_WRITE_FAILED,
     LANGUAGE_SAVE_FAILED, SOURCE_UNSUPPORTED, WINDOW_LIMIT,
 };
 use screenpatch::core::model::CaptureSource;
@@ -27,6 +27,11 @@ struct Fake {
     hotkey_read_error: Option<String>,
     hotkey_write_error: Option<String>,
     written_hotkeys: Option<String>,
+    autocopy_file: Option<String>,
+    autocopy_read_error: Option<String>,
+    autocopy_write_error: Option<String>,
+    written_autocopy: Option<String>,
+    copy_error: Option<String>,
 }
 
 impl PlatformPort for Fake {
@@ -82,7 +87,25 @@ impl PlatformPort for Fake {
     }
 
     fn copy_image(&mut self, pixels: &[u8], _width: u32, _height: u32) -> Result<(), String> {
+        if let Some(err) = &self.copy_error {
+            return Err(err.clone());
+        }
         self.copied = Some(pixels.to_vec());
+        Ok(())
+    }
+
+    fn read_autocopy(&self) -> Result<Option<String>, String> {
+        if let Some(err) = &self.autocopy_read_error {
+            return Err(err.clone());
+        }
+        Ok(self.autocopy_file.clone())
+    }
+
+    fn write_autocopy(&mut self, text: &str) -> Result<(), String> {
+        if let Some(err) = &self.autocopy_write_error {
+            return Err(err.clone());
+        }
+        self.written_autocopy = Some(text.to_string());
         Ok(())
     }
 
@@ -144,6 +167,11 @@ fn fake_ru() -> Fake {
         hotkey_read_error: None,
         hotkey_write_error: None,
         written_hotkeys: None,
+        autocopy_file: None,
+        autocopy_read_error: None,
+        autocopy_write_error: None,
+        written_autocopy: None,
+        copy_error: None,
     }
 }
 
@@ -168,7 +196,7 @@ fn eleventh_capture_and_bad_buffer_are_rejected() {
     let mut session = open_ru(&fake);
     for _ in 0..10 {
         let outcome = session.handle(&mut fake, capture_new(region(), pixels()));
-        assert!(matches!(outcome, Outcome::CaptureSucceeded { number } if number > 0));
+        assert!(matches!(outcome, Outcome::CaptureSucceeded { number, copy_error: None } if number > 0));
     }
     let rejected = session.handle(&mut fake, capture_new(region(), pixels()));
     let Outcome::CaptureFailed { message } = rejected else {
@@ -194,7 +222,7 @@ fn refresh_moves_the_old_frame_to_previous_and_stamps_port_time() {
     session.handle(&mut fake, capture_new(region(), pixels()));
     fake.region_frame = fresh();
     let outcome = session.handle(&mut fake, Request::CaptureRefresh { number: 1, hide: vec![7] });
-    assert!(matches!(outcome, Outcome::CaptureSucceeded { number: 1 }));
+    assert!(matches!(outcome, Outcome::CaptureSucceeded { number: 1, copy_error: None }));
     let capture = session.capture(1).expect("capture");
     let previous = capture.previous.as_ref().expect("previous frame");
     assert_eq!(previous.pixels.as_ref(), pixels().as_slice());
@@ -306,7 +334,7 @@ fn opacity_starts_at_255_and_does_not_follow_the_pixels() {
     let mut fake = fake_ru();
     let mut session = open_ru(&fake);
     let created = session.handle(&mut fake, capture_new(region(), pixels()));
-    assert!(matches!(created, Outcome::CaptureSucceeded { number: 1 }));
+    assert!(matches!(created, Outcome::CaptureSucceeded { number: 1, copy_error: None }));
     assert_eq!(session.capture(1).unwrap().view.opacity, 255);
 
     let lowered = session.handle(&mut fake, Request::OpacitySet { number: 1, opacity: 10 });
@@ -332,7 +360,7 @@ fn lock_starts_open_and_survives_the_frame() {
     let mut fake = fake_ru();
     let mut session = open_ru(&fake);
     let created = session.handle(&mut fake, capture_new(region(), pixels()));
-    assert!(matches!(created, Outcome::CaptureSucceeded { number: 1 }));
+    assert!(matches!(created, Outcome::CaptureSucceeded { number: 1, copy_error: None }));
     assert!(!session.capture(1).unwrap().view.locked);
 
     let closed = session.handle(&mut fake, Request::LockToggled { number: 1 });
@@ -385,7 +413,7 @@ fn hotkeys_start_from_the_file_and_a_bad_file_keeps_the_defaults() {
 
     fake.hotkey_file = None;
     fake.hotkey_read_error = Some("denied".to_string());
-    let (session, _, message) = Session::open(&fake);
+    let (session, _, message, _) = Session::open(&fake);
     assert_eq!(session.hotkeys(), &Hotkeys::default());
     assert_eq!(
         message.as_deref(),
@@ -447,4 +475,84 @@ fn choosing_a_hotkey_writes_the_file_and_a_duplicate_does_not() {
         }
     );
     assert_eq!(session.hotkeys().again, Hotkeys::default().again);
+}
+
+#[test]
+fn autocopy_starts_off_and_a_bad_file_stays_off() {
+    let mut fake = fake_ru();
+    let session = Session::open(&fake).0;
+    assert!(!session.auto_copy());
+
+    fake.autocopy_file = Some("on\n".to_string());
+    let session = Session::open(&fake).0;
+    assert!(session.auto_copy());
+
+    fake.autocopy_file = Some(" \n".to_string());
+    let (session, _, _, message) = Session::open(&fake);
+    assert!(!session.auto_copy());
+    assert!(message.is_none());
+
+    fake.autocopy_file = None;
+    fake.autocopy_read_error = Some("denied".to_string());
+    let (session, _, _, message) = Session::open(&fake);
+    assert!(!session.auto_copy());
+    assert_eq!(
+        message.as_deref(),
+        Some(render(Language::Ru, AUTO_COPY_READ_FAILED, &[("err", "denied")]).as_str())
+    );
+}
+
+#[test]
+fn choosing_autocopy_writes_the_file_and_keeps_the_choice_when_the_write_fails() {
+    let mut fake = fake_ru();
+    let mut session = open_ru(&mut fake);
+    let outcome = session.handle(&mut fake, Request::AutoCopyChosen { enabled: true });
+    assert_eq!(outcome, Outcome::AutoCopySaved { message: None });
+    assert!(session.auto_copy());
+    assert_eq!(fake.written_autocopy.as_deref(), Some("on\n"));
+
+    fake.autocopy_write_error = Some("full".to_string());
+    let failed = session.handle(&mut fake, Request::AutoCopyChosen { enabled: false });
+    assert!(!session.auto_copy());
+    assert_eq!(
+        failed,
+        Outcome::AutoCopySaved {
+            message: Some(render(Language::Ru, AUTO_COPY_SAVE_FAILED, &[("err", "full")]))
+        }
+    );
+}
+
+#[test]
+fn a_new_capture_copies_only_while_autocopy_is_on() {
+    let mut fake = fake_ru();
+    let mut session = open_ru(&mut fake);
+    let created = session.handle(&mut fake, capture_new(region(), pixels()));
+    assert_eq!(created, Outcome::CaptureSucceeded { number: 1, copy_error: None });
+    assert!(fake.copied.is_none());
+
+    session.handle(&mut fake, Request::AutoCopyChosen { enabled: true });
+    fake.copied = None;
+    let copied = session.handle(&mut fake, capture_new(region(), pixels()));
+    assert_eq!(copied, Outcome::CaptureSucceeded { number: 2, copy_error: None });
+    assert_eq!(fake.copied.as_deref(), Some(pixels().as_slice()));
+
+    fake.copied = None;
+    let refreshed = session.handle(&mut fake, Request::CaptureRefresh { number: 2, hide: Vec::new() });
+    assert_eq!(refreshed, Outcome::CaptureSucceeded { number: 2, copy_error: None });
+    assert!(fake.copied.is_none());
+
+    fake.copy_error = Some("busy".to_string());
+    let failed = session.handle(&mut fake, capture_new(region(), pixels()));
+    assert_eq!(
+        failed,
+        Outcome::CaptureSucceeded {
+            number: 3,
+            copy_error: Some(render(
+                Language::Ru,
+                COPY_FAILED,
+                &[("number", "3"), ("err", "busy")]
+            ))
+        }
+    );
+    assert!(session.capture(3).is_some());
 }

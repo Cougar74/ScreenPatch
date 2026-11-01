@@ -1,10 +1,11 @@
 use screenpatch::core::hotkeys::{help_key, help_lines, Hotkeys};
 use screenpatch::core::language::{
-    language_choice, parse_saved_language, render, text, Language, BUTTON_ICON_FAILED, HOTKEY_AGAIN,
+    format_saved_autocopy, language_choice, parse_saved_autocopy, parse_saved_language, render, text,
+    Language, AUTO_COPY_READ_FAILED, AUTO_COPY_SAVE_FAILED, BUTTON_ICON_FAILED, HOTKEY_AGAIN,
     HOTKEY_CHANGE, HOTKEY_CLOSE, HOTKEY_DUPLICATE, HOTKEY_FRAME, HOTKEY_INCLUSIVE, HOTKEY_INCOMPLETE,
     HOTKEY_NEEDS_MODIFIER, HOTKEY_READ_FAILED, HOTKEY_REGISTER_FAILED, HOTKEY_WRITE_FAILED,
-    LANGUAGE_NAME_EN, LANGUAGE_NAME_RU, MONITOR_MISSING, TRAY_HELP, TRAY_HOTKEYS, TRAY_LANGUAGE,
-    TRAY_NEW,
+    LANGUAGE_NAME_EN, LANGUAGE_NAME_RU, MONITOR_MISSING, TRAY_AUTOCOPY, TRAY_HELP, TRAY_HOTKEYS,
+    TRAY_LANGUAGE, TRAY_NEW,
 };
 
 #[test]
@@ -253,4 +254,33 @@ fn hotkey_phrases_use_the_approved_words() {
     assert_eq!(text(Language::En, HOTKEY_AGAIN), "New capture from the window");
     assert_eq!(text(Language::Ru, HOTKEY_CLOSE), "Закрыть снимок");
     assert_eq!(text(Language::En, HOTKEY_CLOSE), "Close the capture");
+}
+
+#[test]
+fn autocopy_file_words_and_phrases() {
+    assert!(parse_saved_autocopy("on"));
+    assert!(parse_saved_autocopy("  on\n"));
+    assert!(!parse_saved_autocopy("off"));
+    assert!(!parse_saved_autocopy(""));
+    assert!(!parse_saved_autocopy("yes"));
+    assert_eq!(format_saved_autocopy(true), "on\n");
+    assert_eq!(format_saved_autocopy(false), "off\n");
+    assert_eq!(text(Language::Ru, TRAY_AUTOCOPY), "Копировать новые снимки");
+    assert_eq!(text(Language::En, TRAY_AUTOCOPY), "Copy new captures");
+    assert_eq!(
+        render(Language::Ru, AUTO_COPY_READ_FAILED, &[("err", "denied")]),
+        "не удалось прочитать автокопирование: denied"
+    );
+    assert_eq!(
+        render(Language::En, AUTO_COPY_READ_FAILED, &[("err", "denied")]),
+        "could not read the automatic copy setting: denied"
+    );
+    assert_eq!(
+        render(Language::Ru, AUTO_COPY_SAVE_FAILED, &[("err", "full")]),
+        "не удалось запомнить автокопирование: full"
+    );
+    assert_eq!(
+        render(Language::En, AUTO_COPY_SAVE_FAILED, &[("err", "full")]),
+        "could not save the automatic copy setting: full"
+    );
 }
