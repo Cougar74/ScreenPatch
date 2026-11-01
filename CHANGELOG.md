@@ -1,5 +1,15 @@
 ﻿# Changelog
 
+## 0.4.0
+
+The Windows binary is `release/ScreenPatch.exe`.
+
+- Each capture has an opacity slider. The picture fades; the buttons, the slider, and the lock stay solid. Copy and a saved PNG use the original opaque pixels.
+- A lock at the top-right of the control strip pins position and size. The other controls still work, and the lock stays in effect while the strip is hidden.
+- The six shortcuts can be changed from the tray. The defaults remain `Ctrl+Shift+S`, `Ctrl+Alt+Shift+S`, `R`, `1`, `S`, and `Esc`. Help shows the combinations that are saved.
+- A tray checkbox, Copy new captures, puts each new capture on the clipboard and still opens its window. Refresh does not copy. The choice is remembered.
+- The tray lists New capture, Show all, Hide all, and Close all captures, then Copy new captures, Shortcuts, and Language.
+
 ## 0.3.0
 
 The Windows binary is `release/ScreenPatch.exe`.
